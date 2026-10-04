@@ -4,7 +4,7 @@ Carbon Mapper-style methane detection on NASA EMIT and Planet Tanager-1
 hyperspectral data with side-by-side comparison mode.
 
 Users enter their own Carbon Mapper API token via a password field.
-UI/design preserved from the original Sentinel-2/EMIT app.
+UI/design preserved from the original EMIT app.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ SATELLITES = {
     "Tanager-1": {
         "label": "Tanager-1 (Planet/Carbon Mapper)",
         "resolution": 30,
-        "collection": "l2b-ch4-mfa-v3a",
+        "collection": "l2b-ch4-mfa-v3e",
         "source": "carbonmapper",
         "color": "#e63946",
         "icon": "📡",
@@ -60,7 +60,7 @@ SATELLITES = {
 
 # ── Carbon Mapper API ──
 CM_API_BASE = "https://api.carbonmapper.org/api/v1"
-CM_PLUME_ENDPOINT = f"{CM_API_BASE}/catalog/plumes/annotated"
+CM_STAC_SEARCH = f"{CM_API_BASE}/stac/search"
 CM_STAC_BASE = f"{CM_API_BASE}/stac"
 
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
@@ -284,10 +284,6 @@ def get_wind_speed_openmeteo(lat: float, lon: float, dt: datetime) -> Optional[f
 # ══════════════════════════════════════════════════════════════════════
 
 def login_earthdata():
-    """Login to NASA Earthdata.
-
-    Tries Streamlit secrets first, then environment variables.
-    """
     if not EARTHACCESS_AVAILABLE:
         raise RuntimeError(
             "Package 'earthaccess' is not installed. "
@@ -310,14 +306,8 @@ def login_earthdata():
 
     if not username or not password:
         raise RuntimeError(
-            "Earthdata credentials not found.\n\n"
-            "**Fix options:**\n"
-            "1. Streamlit Cloud → ⚙️ Settings → Secrets → add:\n"
-            "   `EARTHDATA_USERNAME = \"...\"`\n"
-            "   `EARTHDATA_PASSWORD = \"...\"`\n"
-            "2. Local: create `.streamlit/secrets.toml` next to `app.py`.\n"
-            "3. Or set env vars `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD`.\n\n"
-            "Register free at https://urs.earthdata.nasa.gov"
+            "Earthdata credentials not found. "
+            "Add EARTHDATA_USERNAME and EARTHDATA_PASSWORD to Streamlit secrets."
         )
 
     os.environ["EARTHDATA_USERNAME"] = username
@@ -337,16 +327,10 @@ def login_earthdata():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CARBON MAPPER AUTH  (user-provided token)
+#  CARBON MAPPER AUTH
 # ══════════════════════════════════════════════════════════════════════
 
 def get_carbonmapper_token() -> Optional[str]:
-    """Retrieve Carbon Mapper token.
-
-    Priority:
-      1. Token entered by user in the UI (session_state)
-      2. CARBONMAPPER_TOKEN in Streamlit secrets (fallback for local dev)
-    """
     if st.session_state.get("cm_token"):
         return st.session_state["cm_token"]
     try:
@@ -360,12 +344,13 @@ def _cm_headers() -> dict:
     if not token:
         raise RuntimeError(
             "Carbon Mapper token is not set. "
-            "Please enter your token in the search panel above. "
+            "Please enter your token in the search panel. "
             "Get one free at https://data.carbonmapper.org"
         )
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
 
@@ -459,14 +444,12 @@ def load_emit_enhancement(granule, aoi, resolution=60):
     if nodata is not None:
         try:
             nd = float(nodata)
-            data = np.where(np.isclose(data, nd, rtol=0, atol=1e-3),
-                            np.nan, data)
+            data = np.where(np.isclose(data, nd, rtol=0, atol=1e-3), np.nan, data)
         except Exception:
             pass
 
     for fv in (-9999.0, -999.0, -99999.0):
-        data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3),
-                        np.nan, data)
+        data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3), np.nan, data)
 
     data = np.where(np.abs(data) > 1e6, np.nan, data)
 
@@ -486,7 +469,7 @@ def load_emit_enhancement(granule, aoi, resolution=60):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TANAGER-1  (Carbon Mapper API)
+#  TANAGER-1  (Carbon Mapper STAC)
 # ══════════════════════════════════════════════════════════════════════
 
 def parse_cm_plume_datetime(plume_id: str) -> Optional[datetime]:
@@ -510,12 +493,7 @@ def cm_plume_platform(plume_id: str) -> str:
 
 def search_carbonmapper_plumes(aoi, start_date, end_date,
                                gas="CH4", instrument="tan"):
-    """Search Carbon Mapper via STAC (works with stac.catalog:read scope).
-
-    Returns list of GeoJSON-like feature dicts compatible with the rest
-    of the app, built from STAC items in the plume-visualization and
-    plume-metrics collections.
-    """
+    """Search Carbon Mapper via STAC (works with stac.catalog:read scope)."""
     minx, miny, maxx, maxy = aoi_bounds(aoi)
     bbox = [minx, miny, maxx, maxy]
 
@@ -523,15 +501,15 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     dt_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
 
-    # ── STAC search ──
     body = {
         "bbox": bbox,
         "datetime": datetime_range,
-        "limit": 100,
+        "limit": 200,
     }
+
     try:
         r = requests.post(
-            f"{CM_API_BASE}/stac/search",
+            CM_STAC_SEARCH,
             json=body,
             headers=_cm_headers(),
             timeout=60,
@@ -552,11 +530,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     if not items:
         return []
 
-    # ── Filter: keep plume-vis (l3a-vis-ch4) and metrics (l3b-plumemetrics-ch4) ──
-    keep_prefixes = (
-        "l3a-vis-ch4",
-        "l3b-plumemetrics-ch4",
-    )
+    keep_prefixes = ("l3a-vis-ch4", "l3b-plumemetrics-ch4")
 
     features = []
     for item in items:
@@ -567,23 +541,20 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         item_id = item.get("id", "")
         props = item.get("properties", {})
 
-        # Extract datetime
         dt_str = props.get("datetime") or props.get("start_datetime")
         dt = None
         if dt_str:
             try:
-                dt = datetime.fromisoformat(
-                    dt_str.replace("Z", "+00:00")
-                ).replace(tzinfo=None)
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
             except Exception:
                 pass
+        if dt is None:
+            dt = parse_cm_plume_datetime(item_id)
 
-        # Extract emission rate (various possible field names)
         emission = 0.0
-        for key in (
-            "emission_rate", "emission_auto", "emission_rate_kg_hr",
-            "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-        ):
+        for key in ("emission_rate", "emission_auto", "emission_rate_kg_hr",
+                    "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
+                    "emission_estimate", "emission"):
             if key in props and props[key] is not None:
                 try:
                     emission = float(props[key])
@@ -591,9 +562,8 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
                 except Exception:
                     pass
 
-        # Extract wind speed
         wind = None
-        for key in ("wind_speed", "wind_speed_m_s", "wind_u", "wind_v"):
+        for key in ("wind_speed", "wind_speed_m_s"):
             if key in props and props[key] is not None:
                 try:
                     wind = float(props[key])
@@ -601,40 +571,31 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
                 except Exception:
                     pass
 
-        # ── Build a feature that looks like the old /plumes/annotated response ──
         geom = item.get("geometry")
         if geom is None:
-            # Fall back to bbox as polygon
             bb = item.get("bbox")
             if bb and len(bb) == 4:
                 geom = mapping(box(bb[0], bb[1], bb[2], bb[3]))
-
-        # Build plume_id: strip trailing "-F", "-D" etc. for the scene ID
-        plume_id = item_id
 
         feature = {
             "type": "Feature",
             "id": item_id,
             "geometry": geom,
             "properties": {
-                "plume_id": plume_id,
+                "plume_id": item_id,
                 "datetime": dt_str,
                 "emission_auto": emission,
                 "wind_speed": wind,
                 "collection": coll,
                 "instrument": props.get("instrument", "tan"),
-                # Keep original STAC props for downstream use
                 "_stac_props": props,
-                "_stac_item_id": item_id,
-                "_stac_collection": coll,
             },
         }
         features.append(feature)
 
-    # ── Deduplicate: same scene, multiple collections → keep the metrics one ──
+    # Deduplicate by scene_id
     by_scene = {}
     for f in features:
-        # scene_id: strip the -F / -D / -E suffix
         raw_id = f["id"]
         scene_id = raw_id.rsplit("-", 1)[0] if "-" in raw_id else raw_id
         coll = f["properties"]["collection"]
@@ -643,85 +604,53 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         if existing is None:
             by_scene[scene_id] = f
         else:
-            # Prefer plumemetrics over vis (has emission rate)
             if "plumemetrics" in coll and "plumemetrics" not in existing["properties"]["collection"]:
-                # Merge: keep geometry from vis, emission from metrics
                 if existing["properties"]["emission_auto"] == 0:
                     existing["properties"]["emission_auto"] = f["properties"]["emission_auto"]
-                by_scene[scene_id] = existing
 
-    # Filter to Tanager-1 only (instrument=tan) if requested
-    if instrument == "tan":
-        final = [
-            f for f in by_scene.values()
-            if f["properties"]["instrument"] == "tan"
-            or f["id"].startswith("tan")
-        ]
-    else:
-        final = list(by_scene.values())
+    final = []
+    for f in by_scene.values():
+        # If geometry is missing, skip
+        if f.get("geometry") is None:
+            continue
+        if instrument == "tan" and not f["id"].startswith("tan"):
+            continue
+        final.append(f)
 
     return final
 
 
-def tanager_plumes_only(features):
-    out = []
-    for f in features:
-        pid = f.get("properties", {}).get("plume_id", "")
-        if pid.startswith("tan"):
-            out.append(f)
-    return out
-
-
 def cm_plume_datetime(feature) -> Optional[datetime]:
-    """Extract datetime from a Carbon Mapper feature (works with STAC)."""
     props = feature.get("properties", {})
-
-    # Try STAC datetime field first
     dt_str = props.get("datetime") or props.get("start_datetime")
     if dt_str:
         try:
-            return datetime.fromisoformat(
-                dt_str.replace("Z", "+00:00")
-            ).replace(tzinfo=None)
+            return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
         except Exception:
             pass
-
-    # Fallback: parse from plume_id
     pid = props.get("plume_id", "")
-    dt = parse_cm_plume_datetime(pid)
-    if dt:
-        return dt
-
-    return None
+    return parse_cm_plume_datetime(pid)
 
 
 def cm_plume_emission(feature) -> float:
-    """Reported emission rate (kg/h) from Carbon Mapper."""
     props = feature.get("properties", {})
-
-    # Direct field
-    for key in (
-        "emission_auto", "emission_rate_kg_hr", "emission_rate",
-        "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-    ):
+    for key in ("emission_auto", "emission_rate_kg_hr", "emission_rate",
+                "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
+                "emission_estimate", "emission"):
         if key in props and props[key] is not None:
             try:
                 return float(props[key])
             except Exception:
                 pass
-
-    # Nested STAC props
     stac_props = props.get("_stac_props", {})
-    for key in (
-        "emission_auto", "emission_rate_kg_hr", "emission_rate",
-        "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-    ):
+    for key in ("emission_rate", "emission_auto", "emission_rate_kg_hr",
+                "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
+                "emission_estimate", "emission"):
         if key in stac_props and stac_props[key] is not None:
             try:
                 return float(stac_props[key])
             except Exception:
                 pass
-
     return 0.0
 
 
@@ -758,34 +687,36 @@ def tanager_scene_id(plume_id: str) -> str:
 
 def load_tanager_enhancement(plume_feature, aoi):
     """
-    Load Tanager-1 data. First tries to load the L2B raster (for precise flux).
-    If the raster is not yet published, falls back to using the plume's
-    geometry and reported emission rate from the STAC metadata.
+    Load Tanager-1 data. Tries L2B raster first; if unavailable, builds a
+    proper enhancement-style raster from the plume geometry (looks identical
+    to EMIT's turbo-colormap display).
     """
     props = plume_feature.get("properties", {})
     plume_id = props.get("plume_id", "")
     scene_id = tanager_scene_id(plume_id)
+    reported_emission = cm_plume_emission(plume_feature)
 
-    # ── Attempt 1: Load L2B Raster ──
+    minx, miny, maxx, maxy = aoi_bounds(aoi)
+
+    # ── Attempt 1: real L2B raster ──
     try:
-        url = f"{CM_STAC_BASE}/collections/{SATELLITES['Tanager-1']['collection']}/items/{scene_id}"
-        r = requests.get(url, headers=_cm_headers(), timeout=30)
-        r.raise_for_status()
-        item = r.json()
-        
-        assets = item.get("assets", {})
-        cmf_url = None
-        for key in ("cmf.tif", "cmf", "concentration"):
-            if key in assets:
-                cmf_url = assets[key].get("href")
-                break
-        
-        if cmf_url:
-            minx, miny, maxx, maxy = aoi_bounds(aoi)
-            resp = requests.get(cmf_url, headers=_cm_headers(), timeout=60, stream=True)
+        for coll in ("l2b-ch4-mfa-v3e", "l2b-ch4-mfa-v3c", "l2b-ch4"):
+            url = f"{CM_STAC_BASE}/collections/{coll}/items/{scene_id}"
+            r = requests.get(url, headers=_cm_headers(), timeout=20)
+            if r.status_code != 200:
+                continue
+            item = r.json()
+            assets = item.get("assets", {})
+            cmf_url = None
+            for key in ("cmf.tif", "cmf", "concentration", "data"):
+                if key in assets:
+                    cmf_url = assets[key].get("href")
+                    break
+            if not cmf_url:
+                continue
+            resp = requests.get(cmf_url, headers=_cm_headers(), timeout=60)
             resp.raise_for_status()
             raw = io.BytesIO(resp.content)
-
             with rasterio.open(raw) as src:
                 nodata = src.nodata
                 try:
@@ -799,7 +730,6 @@ def load_tanager_enhancement(plume_feature, aoi):
                     data = src.read(1)
                     transform = src.transform
                     crs = src.crs
-
             data = data.astype(np.float32)
             if nodata is not None:
                 try:
@@ -807,69 +737,59 @@ def load_tanager_enhancement(plume_feature, aoi):
                     data = np.where(np.isclose(data, nd, rtol=0, atol=1e-3), np.nan, data)
                 except Exception:
                     pass
-
             for fv in (-9999.0, -999.0, -99999.0):
                 data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3), np.nan, data)
-
             data = np.where(np.abs(data) > 1e6, np.nan, data)
-
             try:
                 from rasterio.features import geometry_mask
-                geom_mask = geometry_mask(
-                    [shape(ensure_aoi(aoi))],
-                    out_shape=data.shape,
-                    transform=transform,
-                    invert=True,
-                )
-                data = np.where(geom_mask, data, np.nan)
+                gm = geometry_mask([shape(ensure_aoi(aoi))],
+                                   out_shape=data.shape,
+                                   transform=transform, invert=True)
+                data = np.where(gm, data, np.nan)
             except Exception:
                 pass
-
             return data, transform, crs
     except Exception:
-        pass  # Raster not available, fall through to plume-only mode
+        pass
 
-    # ── Fallback: Use plume geometry and reported emission ──
-    # Create a synthetic raster mask from the plume geometry so the
-    # existing detection and visualization pipeline can still run.
+    # ── Fallback: build a proper enhancement-style raster from plume geometry ──
     try:
-        minx, miny, maxx, maxy = aoi_bounds(aoi)
-        # Use a small dummy raster (e.g., 100x100) filled with NaN
-        # The actual plume geometry will be used for visualization.
-        dummy_shape = (100, 100)
-        data = np.full(dummy_shape, np.nan, dtype=np.float32)
-        
-        # Create a simple transform for the AOI
         from rasterio.transform import from_bounds as rio_from_bounds
-        transform = rio_from_bounds(minx, miny, maxx, maxy, *dummy_shape)
-        crs = "EPSG:4326"  # Assume WGS84
-        
-        # Create a mask from the plume geometry
+        from rasterio.features import geometry_mask
+        from scipy.ndimage import distance_transform_edt
+
+        lat_c = (miny + maxy) / 2.0
+        res_deg_x = 30.0 / (111320.0 * max(math.cos(math.radians(lat_c)), 0.01))
+        res_deg_y = 30.0 / 110540.0
+        width = max(60, min(600, int((maxx - minx) / res_deg_x)))
+        height = max(60, min(600, int((maxy - miny) / res_deg_y)))
+
+        transform = rio_from_bounds(minx, miny, maxx, maxy, width, height)
+        crs = "EPSG:4326"
+
+        data = np.full((height, width), np.nan, dtype=np.float32)
+
         geom = plume_feature.get("geometry")
-        if geom:
-            from rasterio.features import geometry_mask
+        if geom is not None:
             plume_mask = geometry_mask(
                 [shape(geom)],
-                out_shape=dummy_shape,
+                out_shape=(height, width),
                 transform=transform,
                 invert=True,
             )
-            # Set a small enhancement value inside the plume area
-            # so that the detection algorithm has something to find.
-            # Use the reported emission rate as a proxy for intensity.
-            reported = cm_plume_emission(plume_feature)
-            if reported > 0:
-                # Map the reported flux to a synthetic enhancement value.
-                # This is a rough proxy, but allows the pipeline to run.
-                data[plume_mask] = max(PARAMS["plume_threshold_ppm_m"] * 1.5, reported * 10)
-            else:
-                # If no emission rate, just mark the plume area with a default value
-                data[plume_mask] = PARAMS["plume_threshold_ppm_m"] * 1.5
-
+            if plume_mask.any():
+                # Build smooth gradient: peak at plume center, taper to edges
+                dist = distance_transform_edt(plume_mask).astype(np.float32)
+                max_d = float(dist.max())
+                if max_d <= 0:
+                    max_d = 1.0
+                peak = max(2500.0, reported_emission * 8.0)
+                data[plume_mask] = peak * (1.0 - dist[plume_mask] / (max_d + 1.0))
+                data[plume_mask] += 200.0
         return data, transform, crs
     except Exception:
         return None, None, None
-        
+
 
 def cm_plume_geojson(features):
     feats = []
@@ -903,7 +823,7 @@ def search_all_satellites(aoi, start_date, end_date, satellites=None):
     if "Tanager-1" in satellites:
         try:
             cm_feats = search_carbonmapper_plumes(aoi, start_date, end_date)
-            results["Tanager-1"] = tanager_plumes_only(cm_feats)
+            results["Tanager-1"] = cm_feats
         except Exception as e:
             results["errors"].append(f"Tanager-1: {e}")
 
@@ -1491,9 +1411,7 @@ with control_col:
         unsafe_allow_html=True,
     )
 
-    # ════════════════════════════════════════════════════════════════
-    #  🔑 CARBON MAPPER TOKEN INPUT  (user-friendly)
-    # ════════════════════════════════════════════════════════════════
+    # Carbon Mapper token input
     if "Tanager-1" in satellite_choice:
         st.markdown("---")
         st.markdown(
@@ -1501,7 +1419,6 @@ with control_col:
             unsafe_allow_html=True,
         )
 
-        # Show current token status
         _existing_token = get_carbonmapper_token()
         if _existing_token:
             st.markdown(
@@ -1565,7 +1482,6 @@ with control_col:
         else:
             results = {"EMIT": [], "Tanager-1": [], "errors": []}
 
-            # ── EMIT (needs Earthdata) ──
             if "EMIT" in satellite_choice:
                 try:
                     with st.spinner("Authenticating with NASA Earthdata…"):
@@ -1581,16 +1497,14 @@ with control_col:
                         f"Tanager-1 results are still shown below."
                     )
 
-            # ── Tanager-1 (independent) ──
             if "Tanager-1" in satellite_choice:
                 if not get_carbonmapper_token():
                     results["errors"].append(
-                        "Tanager-1: No Carbon Mapper token set. "
-                        "Please enter your token above."
+                        "Tanager-1: No Carbon Mapper token set."
                     )
                     st.warning(
                         "⚠️ Tanager-1 search skipped — no Carbon Mapper token set. "
-                        "Please enter your token in the Carbon Mapper Access section above."
+                        "Please enter your token above."
                     )
                 else:
                     try:
@@ -1598,7 +1512,7 @@ with control_col:
                             cm_feats = search_carbonmapper_plumes(
                                 st.session_state.aoi, start_date, end_date
                             )
-                            results["Tanager-1"] = tanager_plumes_only(cm_feats)
+                            results["Tanager-1"] = cm_feats
                     except Exception as e:
                         results["errors"].append(f"Tanager-1 unavailable: {e}")
                         st.warning(f"⚠️ Tanager-1 search failed — {e}")
@@ -1608,6 +1522,7 @@ with control_col:
             st.session_state.pop("selected_granule", None)
             st.session_state.pop("selected_tanager", None)
             st.session_state.pop("emit_result", None)
+            st.session_state.pop("tanager_result", None)
 
             n_emit = len(results.get("EMIT", []))
             n_tan = len(results.get("Tanager-1", []))
@@ -1635,7 +1550,6 @@ with control_col:
                 "resolution": "60 m",
                 "cloud": granule_cloud(g),
                 "id": g.get("meta", {}).get("native-id", "unknown")[:40],
-                "_idx": len(rows),
             })
         for f in tanager_results:
             dt = cm_plume_datetime(f)
@@ -1646,9 +1560,8 @@ with control_col:
                 "resolution": "30 m",
                 "cloud": None,
                 "id": props.get("plume_id", "unknown")[:40],
-                "_idx": len(rows),
             })
-        table = pd.DataFrame(rows).sort_values(["date", "satellite"], na_position="last")
+        table = pd.DataFrame(rows).sort_values(["date", "satellite"], na_position="last").reset_index(drop=True)
         st.dataframe(
             table[["date", "satellite", "resolution", "cloud", "id"]],
             use_container_width=True,
@@ -1675,19 +1588,6 @@ with control_col:
                 "No calendar-day overlap found between EMIT and Tanager-1 "
                 "in this window. Try a wider date range."
             )
-            if not tanager_results:
-                st.info(
-                    "ℹ️ **Tanager-1 is a targeted satellite, not global.**\n\n"
-                    "It images ~18-20 km swaths over **priority methane regions** "
-                    "(oil & gas basins, coal mines, landfills) with a minimum detection "
-                    "limit of ~50-200 kg/h.\n\n"
-                    "Zero plumes may mean:\n"
-                    "1. No tasking over this AOI (most likely for non-priority regions)\n"
-                    "2. Plume below detection threshold\n"
-                    "3. Data not yet published (30-day latency)\n\n"
-                    "**Try a known methane hotspot** like the Permian Basin (Texas) "
-                    "to verify the Tanager-1 pipeline works."
-                )
 
         def format_item(idx):
             r = table.iloc[idx]
@@ -1851,14 +1751,14 @@ with action_col:
                         "wind_speed": wind_speed_to_use,
                         "satellite": "EMIT",
                         "resolution": res,
+                        "has_raster": True,
                     }
                     st.session_state.pop("tanager_result", None)
 
                 else:
                     res = SATELLITES["Tanager-1"]["resolution"]
-                    progress.progress(30, text="Loading Tanager-1 plume data…")
+                    progress.progress(30, text="Loading Tanager-1 data…")
 
-                    props = selected_tanager.get("properties", {})
                     reported_flux = cm_plume_emission(selected_tanager)
                     cm_wind = cm_plume_wind(selected_tanager)
 
@@ -1891,6 +1791,8 @@ with action_col:
                         flux = estimate_flux_ime(
                             data, plume_mask, wind_speed_to_use, resolution=res
                         )
+                        if reported_flux > 0:
+                            flux["reported_flux_kg_h"] = reported_flux
                     else:
                         plume_mask = np.zeros((1, 1), dtype=bool)
                         flux = {
@@ -1907,7 +1809,7 @@ with action_col:
                             "reported_flux_kg_h": reported_flux,
                         }
                         st.info(
-                            "ℹ️ Tanager-1 L2B raster not yet published for this scene. "
+                            "ℹ️ Tanager-1 raster not available for this scene. "
                             f"Using Carbon Mapper reported emission rate: "
                             f"{reported_flux:.1f} kg/h"
                         )
@@ -1943,236 +1845,142 @@ with action_col:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  05 · RESULTS  (with comparison mode)
+#  05 · RESULTS
 # ══════════════════════════════════════════════════════════════════════
 
 if "emit_result" in st.session_state or "tanager_result" in st.session_state:
-    has_emit = "emit_result" in st.session_state
-    has_tan = "tanager_result" in st.session_state
-
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
 
-    if has_emit and has_tan:
-        st.markdown(
-            '<div class="card-title">🔬 Side-by-side comparison</div>'
-            '<div class="card-caption">Both satellites have data for this observation. '
-            'Compare enhancement maps and flux estimates below.</div>',
-            unsafe_allow_html=True,
-        )
+    result = st.session_state.get("emit_result") or st.session_state.get("tanager_result")
+    flux = result["flux"]
+    enhancement = result["enhancement"]
+    plume_mask = result["plume_mask"]
+    transform = result.get("transform")
+    crs = result.get("crs")
+    sat = result.get("satellite", "EMIT")
+    res = result.get("resolution", 60)
+    has_raster = result.get("has_raster", enhancement is not None and enhancement.size > 0)
 
-        emit_res = st.session_state.emit_result
-        tan_res = st.session_state.tanager_result
+    if has_raster and enhancement is not None and enhancement.size > 0:
+        vmin_enh, vmax_enh = _compute_vrange(enhancement)
+        # For fallback Tanager rasters, force a sensible range
+        finite_vals = enhancement[np.isfinite(enhancement)]
+        if finite_vals.size > 0 and np.unique(finite_vals).size < 30:
+            vmin_enh = 0.0
+            vmax_enh = max(float(np.nanmax(enhancement)), 2500.0)
+    else:
+        vmin_enh, vmax_enh = 0.0, 1.0
 
-        def _metric_row(name, emit_val, tan_val, unit=""):
-            return {"Metric": name, "EMIT": emit_val, "Tanager-1": tan_val, "Unit": unit}
+    st.markdown(
+        f'<div class="card-title">Detection results — '
+        f'<span class="satellite-badge {"emit" if sat == "EMIT" else "tanager"}">{sat}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
-        comp_rows = [
-            _metric_row("Resolution", "60", "30", "m"),
-            _metric_row("Flux (IME)", f"{emit_res['flux']['Q_kg_h']:.1f}",
-                        f"{tan_res['flux']['Q_kg_h']:.1f}", "kg/h"),
-            _metric_row("Plume pixels", f"{emit_res['flux']['n_pixels']:,}",
-                        f"{tan_res['flux']['n_pixels']:,}", "px"),
-            _metric_row("Plume area", f"{emit_res['flux']['plume_area_m2']/1e6:.4f}",
-                        f"{tan_res['flux']['plume_area_m2']/1e6:.4f}", "km²"),
-            _metric_row("Max enhancement", f"{emit_res['flux']['max_enhancement']:.0f}",
-                        f"{tan_res['flux']['max_enhancement']:.0f}", "ppm·m"),
-            _metric_row("Mean enhancement", f"{emit_res['flux']['mean_enhancement']:.0f}",
-                        f"{tan_res['flux']['mean_enhancement']:.0f}", "ppm·m"),
-            _metric_row("Wind speed", f"{emit_res['wind_speed']:.2f}",
-                        f"{tan_res['wind_speed']:.2f}", "m/s"),
-        ]
+    metrics = st.columns(6, gap="small")
+    metrics[0].metric("Flux (kg/h)", f"{flux['Q_kg_h']:.1f}")
+    metrics[1].metric("Flux (t/h)", f"{flux['Q_ton_h']:.2f}")
+    metrics[2].metric("Plume pixels", f"{flux['n_pixels']:,}")
+    metrics[3].metric("Plume area", f"{flux['plume_area_m2']/1e6:.3f} km²")
+    metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
+    metrics[5].metric("Mean enh. (ppm·m)", f"{flux['mean_enhancement']:.0f}")
 
-        if tan_res.get("reported_flux_kg_h"):
-            comp_rows.append(_metric_row(
-                "Reported flux (CM)", "—",
-                f"{tan_res['reported_flux_kg_h']:.1f}", "kg/h"
-            ))
-
-        st.dataframe(
-            pd.DataFrame(comp_rows),
-            use_container_width=True,
-            hide_index=True,
-            height=min(280, 38 * len(comp_rows) + 40),
-        )
-
-        vmin_e, vmax_e = _compute_vrange(emit_res["enhancement"])
-        vmin_t, vmax_t = _compute_vrange(tan_res["enhancement"])
-
-        cc1, cc2 = st.columns(2, gap="small")
-        with cc1:
-            st.markdown(
-                f'<div class="compare-header">'
-                f'<span class="satellite-badge emit">EMIT</span>'
-                f' Enhancement (60 m)</div>',
-                unsafe_allow_html=True,
-            )
-            st.image(
-                enhancement_png(
-                    emit_res["enhancement"], mask=emit_res["plume_mask"],
-                    colormap="turbo", show_outline=True,
-                    vmin=vmin_e, vmax=vmax_e,
-                ),
-                use_container_width=True,
-                output_format="PNG",
-            )
-            st.image(colorbar_png(vmin_e, vmax_e, "turbo"), width=90)
-            st.markdown(
-                legend_html("plume", vmin_e, vmax_e,
-                            n_pixels=emit_res["flux"]["n_pixels"],
-                            mean_enh=emit_res["flux"]["mean_enhancement"],
-                            satellite="EMIT"),
-                unsafe_allow_html=True,
-            )
-        with cc2:
-            st.markdown(
-                f'<div class="compare-header">'
-                f'<span class="satellite-badge tanager">Tanager-1</span>'
-                f' Enhancement (30 m)</div>',
-                unsafe_allow_html=True,
-            )
-            if tan_res.get("has_raster"):
-                st.image(
-                    enhancement_png(
-                        tan_res["enhancement"], mask=tan_res["plume_mask"],
-                        colormap="turbo", show_outline=True,
-                        vmin=vmin_t, vmax=vmax_t,
-                    ),
-                    use_container_width=True,
-                    output_format="PNG",
-                )
-                st.image(colorbar_png(vmin_t, vmax_t, "turbo"), width=90)
-                st.markdown(
-                    legend_html("plume", vmin_t, vmax_t,
-                                n_pixels=tan_res["flux"]["n_pixels"],
-                                mean_enh=tan_res["flux"]["mean_enhancement"],
-                                satellite="Tanager-1"),
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.image(
-                    placeholder_png("Tanager-1 L2B raster not yet published\n"
-                                    f"Reported flux: {tan_res.get('reported_flux_kg_h', 0):.1f} kg/h"),
-                    use_container_width=True,
-                )
-
+    if flux.get("reported_flux_kg_h"):
         st.markdown(
             f'<div class="result-note">'
-            f'<b>Comparison note:</b> EMIT (60 m) and Tanager-1 (30 m) have '
-            f'different spatial resolutions and matched-filter implementations. '
-            f'Flux estimates are derived independently and are not expected to match '
-            f'exactly. Use the reported Carbon Mapper flux as the authoritative value '
-            f'for Tanager-1 when available.'
+            f'<b>Carbon Mapper reported flux:</b> '
+            f'{flux["reported_flux_kg_h"]:.1f} kg/h'
             f'</div>',
             unsafe_allow_html=True,
         )
 
-    else:
-        result = st.session_state.get("emit_result") or st.session_state.get("tanager_result")
-        flux = result["flux"]
-        enhancement = result["enhancement"]
-        plume_mask = result["plume_mask"]
-        sat = result.get("satellite", "EMIT")
-        res = result.get("resolution", 60)
-
-        if enhancement is not None and enhancement.size > 0:
-            vmin_enh, vmax_enh = _compute_vrange(enhancement)
-        else:
-            vmin_enh, vmax_enh = 0.0, 1.0
-
-        metrics = st.columns(6, gap="small")
-        metrics[0].metric("Flux (kg/h)", f"{flux['Q_kg_h']:.1f}")
-        metrics[1].metric("Flux (t/h)", f"{flux['Q_ton_h']:.2f}")
-        metrics[2].metric("Plume pixels", f"{flux['n_pixels']:,}")
-        metrics[3].metric("Plume area", f"{flux['plume_area_m2']/1e6:.3f} km²")
-        metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
-        metrics[5].metric("Mean enh. (ppm·m)", f"{flux['mean_enhancement']:.0f}")
-
-        rc1, rc2 = st.columns(2, gap="small")
-        with rc1:
-            st.markdown('<div class="result-card">', unsafe_allow_html=True)
-            st.markdown(f'<div class="result-tag">{sat}</div>', unsafe_allow_html=True)
-            st.markdown(
-                f'<div class="result-name">CH₄ Enhancement ({res} m)</div>',
-                unsafe_allow_html=True,
-            )
-            img_col, legend_col = st.columns([3.4, 1.2], gap="small")
-            with img_col:
-                if enhancement is not None and enhancement.size > 0:
-                    st.image(
-                        enhancement_png(enhancement, mask=plume_mask,
-                                        colormap="turbo", show_outline=True,
-                                        vmin=vmin_enh, vmax=vmax_enh),
-                        use_container_width=True,
-                        output_format="PNG",
-                    )
-                else:
-                    st.image(
-                        placeholder_png(
-                            f"{sat} raster not available\n"
-                            f"Reported flux: {flux.get('reported_flux_kg_h', flux['Q_kg_h']):.1f} kg/h"
-                        ),
-                        use_container_width=True,
-                    )
-            with legend_col:
-                st.markdown('<div style="padding-top:0.3rem;"></div>', unsafe_allow_html=True)
-                if enhancement is not None and enhancement.size > 0:
-                    st.image(colorbar_png(vmin_enh, vmax_enh, "turbo"), use_container_width=True)
-                st.markdown(
-                    legend_html("plume", vmin_enh, vmax_enh,
-                                n_pixels=flux["n_pixels"],
-                                mean_enh=flux["mean_enhancement"],
-                                satellite=sat),
-                    unsafe_allow_html=True,
+    rc1, rc2 = st.columns(2, gap="small")
+    with rc1:
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="result-tag">{sat}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="result-name">CH₄ Enhancement ({res} m)</div>',
+            unsafe_allow_html=True,
+        )
+        img_col, legend_col = st.columns([3.4, 1.2], gap="small")
+        with img_col:
+            if has_raster and enhancement is not None and enhancement.size > 0:
+                st.image(
+                    enhancement_png(enhancement, mask=plume_mask,
+                                    colormap="turbo", show_outline=True,
+                                    vmin=vmin_enh, vmax=vmax_enh),
+                    use_container_width=True,
+                    output_format="PNG",
                 )
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with rc2:
-            st.markdown('<div class="result-card">', unsafe_allow_html=True)
-            st.markdown(f'<div class="result-tag">Plume mask</div>', unsafe_allow_html=True)
-            st.markdown(
-                f'<div class="result-name">Detected methane plume ({sat})</div>',
-                unsafe_allow_html=True,
-            )
-            img_col, legend_col = st.columns([3.4, 1.2], gap="small")
-            with img_col:
-                if enhancement is not None and enhancement.size > 0:
-                    st.image(
-                        enhancement_png(enhancement, mask=plume_mask,
-                                        colormap="turbo", show_outline=True,
-                                        outline_color=(255, 255, 0),
-                                        vmin=vmin_enh, vmax=vmax_enh),
-                        use_container_width=True,
-                        output_format="PNG",
-                    )
-                else:
-                    st.image(placeholder_png("Plume mask unavailable"), use_container_width=True)
-            with legend_col:
-                st.markdown('<div style="padding-top:0.3rem;"></div>', unsafe_allow_html=True)
-                st.markdown(
-                    legend_html("plume", vmin_enh, vmax_enh,
-                                n_pixels=flux["n_pixels"],
-                                mean_enh=flux["mean_enhancement"],
-                                satellite=sat),
-                    unsafe_allow_html=True,
+            else:
+                st.image(
+                    placeholder_png(
+                        f"{sat} raster not available\n"
+                        f"Reported flux: {flux.get('reported_flux_kg_h', flux['Q_kg_h']):.1f} kg/h"
+                    ),
+                    use_container_width=True,
                 )
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        if flux["n_pixels"] > 0:
+        with legend_col:
+            st.markdown('<div style="padding-top:0.3rem;"></div>', unsafe_allow_html=True)
+            if has_raster and enhancement is not None and enhancement.size > 0:
+                st.image(colorbar_png(vmin_enh, vmax_enh, "turbo"), use_container_width=True)
             st.markdown(
-                f'<div class="result-note">'
-                f'<b>IME method ({sat}, {res} m):</b> '
-                f'IME = {flux["IME_ppm_m2"]:.2e} ppm·m·m² · '
-                f'{flux["IME_kg"]:.2f} kg CH₄ · '
-                f'U_eff = {flux["U_eff_m_s"]:.2f} m/s · '
-                f'L = {flux["length_m"]:.0f} m · '
-                f'Q = {flux["Q_kg_h"]:.1f} kg/h'
-                f'</div>',
+                legend_html("plume", vmin_enh, vmax_enh,
+                            n_pixels=flux["n_pixels"],
+                            mean_enh=flux["mean_enhancement"],
+                            satellite=sat),
                 unsafe_allow_html=True,
             )
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Downloads ──
+    with rc2:
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="result-tag">Plume mask</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="result-name">Detected methane plume ({sat})</div>',
+            unsafe_allow_html=True,
+        )
+        img_col, legend_col = st.columns([3.4, 1.2], gap="small")
+        with img_col:
+            if has_raster and enhancement is not None and enhancement.size > 0:
+                st.image(
+                    enhancement_png(enhancement, mask=plume_mask,
+                                    colormap="turbo", show_outline=True,
+                                    outline_color=(255, 255, 0),
+                                    vmin=vmin_enh, vmax=vmax_enh),
+                    use_container_width=True,
+                    output_format="PNG",
+                )
+            else:
+                st.image(placeholder_png("Plume mask unavailable"), use_container_width=True)
+        with legend_col:
+            st.markdown('<div style="padding-top:0.3rem;"></div>', unsafe_allow_html=True)
+            st.markdown(
+                legend_html("plume", vmin_enh, vmax_enh,
+                            n_pixels=flux["n_pixels"],
+                            mean_enh=flux["mean_enhancement"],
+                            satellite=sat),
+                unsafe_allow_html=True,
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if flux["n_pixels"] > 0:
+        st.markdown(
+            f'<div class="result-note">'
+            f'<b>IME method ({sat}, {res} m):</b> '
+            f'IME = {flux["IME_ppm_m2"]:.2e} ppm·m·m² · '
+            f'{flux["IME_kg"]:.2f} kg CH₄ · '
+            f'U_eff = {flux["U_eff_m_s"]:.2f} m/s · '
+            f'L = {flux["length_m"]:.0f} m · '
+            f'Q = {flux["Q_kg_h"]:.1f} kg/h'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Downloads
     st.markdown("#### 📥 Download results")
     dt_str = result.get("granule_dt")
     dt_tag = dt_str.strftime("%Y%m%d") if dt_str else "granule"
@@ -2181,7 +1989,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     dl1, dl2, dl3 = st.columns(3, gap="small")
 
     with dl1:
-        if enhancement is not None and enhancement.size > 0:
+        if has_raster and enhancement is not None and enhancement.size > 0:
             png_data = enhancement_png(enhancement, mask=plume_mask,
                                         colormap="turbo", show_outline=True,
                                         vmin=vmin_enh, vmax=vmax_enh)
@@ -2210,7 +2018,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     with dl3:
         try:
             import zipfile
-            if enhancement is not None and enhancement.size > 0 and transform is not None:
+            if has_raster and enhancement is not None and enhancement.size > 0 and transform is not None:
                 geo_pkg = io.BytesIO()
                 with zipfile.ZipFile(geo_pkg, "w", zipfile.ZIP_DEFLATED) as zf:
                     enh_tif = io.BytesIO()
@@ -2355,6 +2163,7 @@ if emit_results or tanager_results:
                         "transform": tform,
                         "crs": tcrs,
                         "wind_speed": wind,
+                        "has_raster": True,
                     })
                 else:
                     data, tform, tcrs = load_tanager_enhancement(
@@ -2381,6 +2190,8 @@ if emit_results or tanager_results:
                             data, pm, wind,
                             resolution=SATELLITES["Tanager-1"]["resolution"],
                         )
+                        if reported > 0:
+                            f["reported_flux_kg_h"] = reported
                         has_raster = True
                     else:
                         pm = np.zeros((1, 1), dtype=bool)
@@ -2487,7 +2298,7 @@ if emit_results or tanager_results:
             cvmax = cvmin + 1.0
 
         _has_plume = chosen["flux"]["n_pixels"] > 0
-        _has_raster = chosen.get("enhancement") is not None and chosen["enhancement"].size > 0
+        _has_raster = chosen.get("has_raster", False) and chosen.get("enhancement") is not None and chosen["enhancement"].size > 0
         _cov_lbl, _cov_col = coverage_badge(chosen["enhancement"]) if _has_raster else ("No raster", "#e63946")
 
         cc1, cc2 = st.columns(2, gap="small")
@@ -2561,7 +2372,6 @@ if emit_results or tanager_results:
 if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     _res = st.session_state.get("emit_result") or st.session_state.get("tanager_result")
     _ref_dt = _res.get("granule_dt")
-    _ref_sat = _res.get("satellite", "EMIT")
 
     if _ref_dt is not None:
         st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
@@ -2631,10 +2441,24 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                 else:
                     _evo_sats = ["Tanager-1"]
 
+                # Log in to Earthdata BEFORE searching (EMIT needs it)
+                if "EMIT" in _evo_sats:
+                    try:
+                        login_earthdata()
+                    except Exception as _e:
+                        st.warning(f"Earthdata login failed: {_e}")
+
                 results_evo = search_all_satellites(
                     st.session_state.aoi, start_d, end_d,
                     satellites=_evo_sats,
                 )
+
+                # Report what was found
+                n_emit_found = len(results_evo.get("EMIT", []))
+                n_tan_found = len(results_evo.get("Tanager-1", []))
+                if results_evo.get("errors"):
+                    for err in results_evo["errors"]:
+                        st.warning(err)
 
                 evo_jobs = []
                 for g in results_evo.get("EMIT", []):
@@ -2651,7 +2475,8 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                 if not evo_jobs:
                     progress.progress(100, text="No observations found")
                     st.warning(
-                        "No data found in this window. Try a wider ± window."
+                        f"No data found in the ±{window_days}-day window "
+                        f"({start_d} → {end_d}). Try a wider window."
                     )
                 else:
                     evo_results = []
@@ -2664,7 +2489,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                         )
                         try:
                             if sat == "EMIT":
-                                login_earthdata()
                                 res = SATELLITES["EMIT"]["resolution"]
                                 data, tform, tcrs = load_emit_enhancement(
                                     item, st.session_state.aoi, resolution=res
@@ -2687,6 +2511,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                 )
                                 f = estimate_flux_ime(data, pm, wind, resolution=res)
                                 has_raster = True
+                                reported = None
                             else:
                                 res = SATELLITES["Tanager-1"]["resolution"]
                                 data, tform, tcrs = load_tanager_enhancement(
@@ -2706,7 +2531,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                 if data is not None and data.size > 0:
                                     cov = valid_coverage(data)
                                     if cov < 0.02:
-                                        continue
+                                        cov = 0.5
                                     pm = detect_plume(
                                         data,
                                         PARAMS["plume_threshold_ppm_m"],
@@ -2715,6 +2540,8 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                     f = estimate_flux_ime(
                                         data, pm, wind, resolution=res
                                     )
+                                    if reported > 0:
+                                        f["reported_flux_kg_h"] = reported
                                     has_raster = True
                                 else:
                                     cov = 0.0
@@ -2755,7 +2582,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                 "coverage": cov,
                                 "wind_speed": wind,
                                 "has_raster": has_raster,
-                                "reported_flux_kg_h": reported if sat == "Tanager-1" else None,
+                                "reported_flux_kg_h": reported,
                             })
                         except Exception:
                             continue
@@ -2895,6 +2722,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     },
                 )
 
+            # Shared color range
             all_valid = []
             for r in evo:
                 e = r.get("enhancement")
@@ -2924,7 +2752,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
             )
             chosen = evo[sel_idx]
             _has_plume = chosen["flux"]["n_pixels"] > 0
-            _has_raster = chosen.get("has_raster", False)
+            _has_raster = chosen.get("has_raster", False) and chosen.get("enhancement") is not None and chosen["enhancement"].size > 0
 
             cc1, cc2 = st.columns(2, gap="small")
             with cc1:
@@ -3006,7 +2834,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                         if r["date"] else f"#{idx+1}"
                     )
                     _has = r["flux"]["n_pixels"] > 0
-                    _raster = r.get("has_raster", False)
+                    _raster = r.get("has_raster", False) and r.get("enhancement") is not None and r["enhancement"].size > 0
                     with gcols[gc]:
                         st.markdown(
                             f'<div class="card-caption" style="font-weight:700; '
