@@ -501,24 +501,37 @@ def cm_plume_platform(plume_id: str) -> str:
     return "unknown"
 
 
-def search_carbonmapper_plumes(aoi, start_date, end_date, gas="CH4"):
-    """Search Carbon Mapper plume catalog for Tanager-1 (and optionally EMIT) plumes.
+def search_carbonmapper_plumes(aoi, start_date, end_date,
+                               gas="CH4", instruments=None):
+    """Search Carbon Mapper plume catalog.
 
-    Uses the REST ``/catalog/plumes/annotated`` endpoint with repeated bbox keys.
-    Returns a list of GeoJSON features.
+    Uses correct API params based on https://api.carbonmapper.org docs:
+      - datetime : "START/END" ISO-8601 range (not start_time/end_time)
+      - bbox     : comma-separated "minLon,minLat,maxLon,maxLat"
+      - instruments : comma-separated codes ("tan", "emi", ...)
     """
+    if instruments is None:
+        instruments = "tan"   # default: Tanager-1 only
+
     minx, miny, maxx, maxy = aoi_bounds(aoi)
+    bbox_str = f"{minx},{miny},{maxx},{maxy}"
+
+    # datetime range in Carbon Mapper format
+    dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
+    dt_end   = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
+    datetime_range = f"{dt_start}/{dt_end}"
+
     all_features = []
     offset = 0
     limit = 100
-    max_pages = 20  # safety cap
+    max_pages = 20
 
     for _ in range(max_pages):
         params = {
-            "bbox": [minx, miny, maxx, maxy],   # repeated keys
+            "bbox": bbox_str,
+            "datetime": datetime_range,
             "plume_gas": gas,
-            "start_time": start_date.strftime("%Y-%m-%dT00:00:00Z"),
-            "end_time": end_date.strftime("%Y-%m-%dT23:59:59Z"),
+            "instruments": instruments,
             "limit": limit,
             "offset": offset,
         }
@@ -544,15 +557,16 @@ def search_carbonmapper_plumes(aoi, start_date, end_date, gas="CH4"):
         offset += limit
 
     return all_features
-
+                                   
 
 def tanager_plumes_only(features):
-    """Filter Carbon Mapper features to Tanager-1 plumes."""
-    return [
-        f for f in features
-        if cm_plume_platform(f.get("properties", {}).get("plume_id", "")) == "Tanager-1"
-    ]
-
+    """Keep only Tanager-1 plumes (safety filter)."""
+    out = []
+    for f in features:
+        pid = f.get("properties", {}).get("plume_id", "")
+        if pid.startswith("tan"):
+            out.append(f)
+    return out
 
 def cm_plume_datetime(feature) -> Optional[datetime]:
     """Extract datetime from a Carbon Mapper plume feature."""
