@@ -510,66 +510,157 @@ def cm_plume_platform(plume_id: str) -> str:
 
 def search_carbonmapper_plumes(aoi, start_date, end_date,
                                gas="CH4", instrument="tan"):
-    """Search Carbon Mapper plume catalog (Tanager-1 by default).
+    """Search Carbon Mapper via STAC (works with stac.catalog:read scope).
 
-    Correct API contract (from https://api.carbonmapper.org/api/v1/docs):
-      - bbox      : repeated keys  -> ?bbox=W&bbox=S&bbox=E&bbox=N
-      - datetime  : "START/END" ISO-8601 interval
-      - plume_gas : "CH4"
-      - instrument: "tan" / "emi" / "ang" / "av3" / "GAO"
+    Returns list of GeoJSON-like feature dicts compatible with the rest
+    of the app, built from STAC items in the plume-visualization and
+    plume-metrics collections.
     """
     minx, miny, maxx, maxy = aoi_bounds(aoi)
+    bbox = [minx, miny, maxx, maxy]
 
     dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
     dt_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
 
-    all_features = []
-    offset = 0
-    limit = 100
-    max_pages = 20
-
-    for _ in range(max_pages):
-        params = [
-            ("bbox", minx),
-            ("bbox", miny),
-            ("bbox", maxx),
-            ("bbox", maxy),
-            ("datetime", datetime_range),
-            ("plume_gas", gas),
-            ("instrument", instrument),
-            ("limit", limit),
-            ("offset", offset),
-        ]
-        try:
-            r = requests.get(
-                CM_PLUME_ENDPOINT,
-                params=params,
-                headers=_cm_headers(),
-                timeout=30,
+    # ── STAC search ──
+    body = {
+        "bbox": bbox,
+        "datetime": datetime_range,
+        "limit": 100,
+    }
+    try:
+        r = requests.post(
+            f"{CM_API_BASE}/stac/search",
+            json=body,
+            headers=_cm_headers(),
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except requests.exceptions.HTTPError as e:
+        if r.status_code == 401:
+            raise RuntimeError(
+                "Carbon Mapper token is invalid or expired. "
+                "Please create a new token at https://data.carbonmapper.org"
             )
-            r.raise_for_status()
-            data = r.json()
-        except requests.exceptions.HTTPError as e:
-            if r.status_code == 401:
-                raise RuntimeError(
-                    "Carbon Mapper token is invalid or expired. "
-                    "Please create a new token at https://data.carbonmapper.org"
-                )
-            raise RuntimeError(f"Carbon Mapper plume search failed: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Carbon Mapper plume search failed: {e}")
+        raise RuntimeError(f"Carbon Mapper STAC search failed: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Carbon Mapper STAC search failed: {e}")
 
-        features = data.get("features", [])
-        if not features:
-            break
-        all_features.extend(features)
+    items = data.get("features", [])
+    if not items:
+        return []
 
-        if len(features) < limit:
-            break
-        offset += limit
+    # ── Filter: keep plume-vis (l3a-vis-ch4) and metrics (l3b-plumemetrics-ch4) ──
+    keep_prefixes = (
+        "l3a-vis-ch4",
+        "l3b-plumemetrics-ch4",
+    )
 
-    return all_features
+    features = []
+    for item in items:
+        coll = item.get("collection", "")
+        if not any(coll.startswith(p) for p in keep_prefixes):
+            continue
+
+        item_id = item.get("id", "")
+        props = item.get("properties", {})
+
+        # Extract datetime
+        dt_str = props.get("datetime") or props.get("start_datetime")
+        dt = None
+        if dt_str:
+            try:
+                dt = datetime.fromisoformat(
+                    dt_str.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                pass
+
+        # Extract emission rate (various possible field names)
+        emission = 0.0
+        for key in (
+            "emission_rate", "emission_auto", "emission_rate_kg_hr",
+            "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
+        ):
+            if key in props and props[key] is not None:
+                try:
+                    emission = float(props[key])
+                    break
+                except Exception:
+                    pass
+
+        # Extract wind speed
+        wind = None
+        for key in ("wind_speed", "wind_speed_m_s", "wind_u", "wind_v"):
+            if key in props and props[key] is not None:
+                try:
+                    wind = float(props[key])
+                    break
+                except Exception:
+                    pass
+
+        # ── Build a feature that looks like the old /plumes/annotated response ──
+        geom = item.get("geometry")
+        if geom is None:
+            # Fall back to bbox as polygon
+            bb = item.get("bbox")
+            if bb and len(bb) == 4:
+                geom = mapping(box(bb[0], bb[1], bb[2], bb[3]))
+
+        # Build plume_id: strip trailing "-F", "-D" etc. for the scene ID
+        plume_id = item_id
+
+        feature = {
+            "type": "Feature",
+            "id": item_id,
+            "geometry": geom,
+            "properties": {
+                "plume_id": plume_id,
+                "datetime": dt_str,
+                "emission_auto": emission,
+                "wind_speed": wind,
+                "collection": coll,
+                "instrument": props.get("instrument", "tan"),
+                # Keep original STAC props for downstream use
+                "_stac_props": props,
+                "_stac_item_id": item_id,
+                "_stac_collection": coll,
+            },
+        }
+        features.append(feature)
+
+    # ── Deduplicate: same scene, multiple collections → keep the metrics one ──
+    by_scene = {}
+    for f in features:
+        # scene_id: strip the -F / -D / -E suffix
+        raw_id = f["id"]
+        scene_id = raw_id.rsplit("-", 1)[0] if "-" in raw_id else raw_id
+        coll = f["properties"]["collection"]
+
+        existing = by_scene.get(scene_id)
+        if existing is None:
+            by_scene[scene_id] = f
+        else:
+            # Prefer plumemetrics over vis (has emission rate)
+            if "plumemetrics" in coll and "plumemetrics" not in existing["properties"]["collection"]:
+                # Merge: keep geometry from vis, emission from metrics
+                if existing["properties"]["emission_auto"] == 0:
+                    existing["properties"]["emission_auto"] = f["properties"]["emission_auto"]
+                by_scene[scene_id] = existing
+
+    # Filter to Tanager-1 only (instrument=tan) if requested
+    if instrument == "tan":
+        final = [
+            f for f in by_scene.values()
+            if f["properties"]["instrument"] == "tan"
+            or f["id"].startswith("tan")
+        ]
+    else:
+        final = list(by_scene.values())
+
+    return final
 
 
 def tanager_plumes_only(features):
@@ -582,28 +673,55 @@ def tanager_plumes_only(features):
 
 
 def cm_plume_datetime(feature) -> Optional[datetime]:
+    """Extract datetime from a Carbon Mapper feature (works with STAC)."""
     props = feature.get("properties", {})
+
+    # Try STAC datetime field first
+    dt_str = props.get("datetime") or props.get("start_datetime")
+    if dt_str:
+        try:
+            return datetime.fromisoformat(
+                dt_str.replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+        except Exception:
+            pass
+
+    # Fallback: parse from plume_id
     pid = props.get("plume_id", "")
     dt = parse_cm_plume_datetime(pid)
     if dt:
         return dt
-    dt_str = props.get("datetime") or props.get("acquisition_date")
-    if dt_str:
-        try:
-            return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            pass
+
     return None
 
 
 def cm_plume_emission(feature) -> float:
+    """Reported emission rate (kg/h) from Carbon Mapper."""
     props = feature.get("properties", {})
-    for key in ("emission_auto", "emission_rate_kg_hr", "emission_rate"):
+
+    # Direct field
+    for key in (
+        "emission_auto", "emission_rate_kg_hr", "emission_rate",
+        "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
+    ):
         if key in props and props[key] is not None:
             try:
                 return float(props[key])
             except Exception:
                 pass
+
+    # Nested STAC props
+    stac_props = props.get("_stac_props", {})
+    for key in (
+        "emission_auto", "emission_rate_kg_hr", "emission_rate",
+        "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
+    ):
+        if key in stac_props and stac_props[key] is not None:
+            try:
+                return float(stac_props[key])
+            except Exception:
+                pass
+
     return 0.0
 
 
