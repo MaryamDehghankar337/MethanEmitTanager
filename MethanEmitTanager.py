@@ -502,21 +502,17 @@ def cm_plume_platform(plume_id: str) -> str:
 
 
 def search_carbonmapper_plumes(aoi, start_date, end_date,
-                               gas="CH4", instruments=None):
-    """Search Carbon Mapper plume catalog.
+                               gas="CH4", instrument="tan"):
+    """Search Carbon Mapper plume catalog (Tanager-1 by default).
 
-    Uses correct API params based on https://api.carbonmapper.org docs:
-      - datetime : "START/END" ISO-8601 range (not start_time/end_time)
-      - bbox     : comma-separated "minLon,minLat,maxLon,maxLat"
-      - instruments : comma-separated codes ("tan", "emi", ...)
+    Correct API contract (from https://api.carbonmapper.org/api/v1/docs):
+      - bbox      : repeated keys  -> ?bbox=W&bbox=S&bbox=E&bbox=N
+      - datetime  : "START/END" ISO-8601 interval (not start_time/end_time)
+      - plume_gas : "CH4" (not "gas")
+      - instrument: "tan" / "emi" / "ang" / "av3" / "GAO" (case-sensitive)
     """
-    if instruments is None:
-        instruments = "tan"   # default: Tanager-1 only
-
     minx, miny, maxx, maxy = aoi_bounds(aoi)
-    bbox_str = f"{minx},{miny},{maxx},{maxy}"
 
-    # datetime range in Carbon Mapper format
     dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
     dt_end   = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
@@ -527,14 +523,18 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     max_pages = 20
 
     for _ in range(max_pages):
-        params = {
-            "bbox": bbox_str,
-            "datetime": datetime_range,
-            "plume_gas": gas,
-            "instruments": instruments,
-            "limit": limit,
-            "offset": offset,
-        }
+        # ✅ Use list of tuples to send repeated bbox keys
+        params = [
+            ("bbox", minx),
+            ("bbox", miny),
+            ("bbox", maxx),
+            ("bbox", maxy),
+            ("datetime", datetime_range),
+            ("plume_gas", gas),
+            ("instrument", instrument),
+            ("limit", limit),
+            ("offset", offset),
+        ]
         try:
             r = requests.get(
                 CM_PLUME_ENDPOINT,
