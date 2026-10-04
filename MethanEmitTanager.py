@@ -88,6 +88,27 @@ CM_PLATFORM_MAP = {
     "gao": "GAO",
 }
 
+# Carbon Mapper STAC emission-related keys (expanded)
+CM_EMISSION_KEYS = (
+    "emission_rate",
+    "emission_auto",
+    "emission_rate_kg_hr",
+    "emission_rate_kg_hr_mean",
+    "emission_rate_kg_hr_median",
+    "emission_rate_auto",
+    "emission_rate_uncertainty",
+    "flux_kg_hr",
+    "cm_emission_rate",
+    "ch4_emission_rate",
+    "emission_estimate",
+    "emission",
+    "ime_flux",
+    "emission_rate_ch4",
+    "ch4_flux",
+    "ch4_flux_kg_hr",
+    "methane_emission_rate",
+)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  GEOMETRY HELPERS
@@ -473,12 +494,28 @@ def load_emit_enhancement(granule, aoi, resolution=60):
 # ══════════════════════════════════════════════════════════════════════
 
 def parse_cm_plume_datetime(plume_id: str) -> Optional[datetime]:
+    """Parse datetime from a Carbon Mapper plume/scene id.
+
+    Handles ids like:
+        tan20260803t083659c56s4001-A
+        tan20260803t083659c56s4001
+        emit20250101t120000...
+    """
+    if not plume_id:
+        return None
     try:
         for prefix in CM_PLATFORM_MAP:
             if plume_id.startswith(prefix):
                 rest = plume_id[len(prefix):]
-                ts = rest[:15]
-                return datetime.strptime(ts, "%Y%m%dT%H%M%S")
+                # Find first 't' followed by 6 digits
+                for i in range(len(rest) - 6):
+                    if rest[i] == "t" and rest[i+1:i+7].isdigit():
+                        ts = rest[:i+7]  # e.g. 20260803t083659
+                        return datetime.strptime(ts, "%Y%m%dT%H%M%S")
+                # Fallback: assume first 15 chars
+                if len(rest) >= 15:
+                    ts = rest[:15]
+                    return datetime.strptime(ts, "%Y%m%dT%H%M%S")
     except Exception:
         pass
     return None
@@ -491,6 +528,35 @@ def cm_plume_platform(plume_id: str) -> str:
     return "unknown"
 
 
+def _extract_numeric(props: dict, keys) -> Optional[float]:
+    """Try to extract a numeric value from props using a list of keys.
+    Also searches inside nested dicts (e.g. props['properties']) as fallback.
+    """
+    if not isinstance(props, dict):
+        return None
+
+    # direct lookup
+    for key in keys:
+        if key in props and props[key] is not None:
+            try:
+                return float(props[key])
+            except (TypeError, ValueError):
+                pass
+
+    # nested lookup (one level deep) — some STAC impls nest under 'properties'
+    for nested_key in ("properties", "stac_properties", "cm_properties", "assets_meta"):
+        nested = props.get(nested_key)
+        if isinstance(nested, dict):
+            for key in keys:
+                if key in nested and nested[key] is not None:
+                    try:
+                        return float(nested[key])
+                    except (TypeError, ValueError):
+                        pass
+
+    return None
+
+
 def search_carbonmapper_plumes(aoi, start_date, end_date,
                                gas="CH4", instrument="tan"):
     """Search Carbon Mapper via STAC with pagination and required collections."""
@@ -500,11 +566,10 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     dt_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
 
-    # Base search body with limit=100 (API maximum)
     body = {
         "bbox": [minx, miny, maxx, maxy],
         "datetime": datetime_range,
-        "limit": 100,  # ✅ API max is 100 (was 200 → caused 400 error)
+        "limit": 100,
         "collections": [
             "l3a-vis-ch4",
             "l3a-ime-ch4",
@@ -517,8 +582,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     url = CM_STAC_SEARCH
     current_body = dict(body)
 
-    # Paginate through all result pages
-    for _ in range(20):  # safety cap
+    for _ in range(20):
         try:
             r = requests.post(
                 url,
@@ -546,7 +610,6 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
             break
         all_items.extend(items)
 
-        # Find next-page link
         next_link = None
         for link in data.get("links", []):
             if link.get("rel") == "next":
@@ -555,8 +618,6 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
 
         if next_link is None:
             break
-
-        # Next page is a POST with merged body
         if next_link.get("method") != "POST":
             break
         url = next_link.get("href", CM_STAC_SEARCH)
@@ -565,7 +626,6 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     if not all_items:
         return []
 
-    # ── Filter to plume collections ──
     keep_prefixes = ("l3a-vis-ch4", "l3a-ime-ch4", "l3b-plumemetrics-ch4")
 
     features = []
@@ -589,25 +649,8 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         if dt is None:
             dt = parse_cm_plume_datetime(item_id)
 
-        emission = 0.0
-        for key in ("emission_rate", "emission_auto", "emission_rate_kg_hr",
-                    "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-                    "emission_estimate", "emission", "ime_flux"):
-            if key in props and props[key] is not None:
-                try:
-                    emission = float(props[key])
-                    break
-                except Exception:
-                    pass
-
-        wind = None
-        for key in ("wind_speed", "wind_speed_m_s"):
-            if key in props and props[key] is not None:
-                try:
-                    wind = float(props[key])
-                    break
-                except Exception:
-                    pass
+        emission = _extract_numeric(props, CM_EMISSION_KEYS) or 0.0
+        wind = _extract_numeric(props, ("wind_speed", "wind_speed_m_s"))
 
         geom = item.get("geometry")
         if geom is None:
@@ -631,23 +674,30 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         }
         features.append(feature)
 
-    # ── Deduplicate by scene_id ──
-    by_scene = {}
+    # ── Deduplicate by FULL plume_id (preserves multiple plumes per scene) ──
+    by_id = {}
     for f in features:
-        raw_id = f["id"]
-        scene_id = raw_id.rsplit("-", 1)[0] if "-" in raw_id else raw_id
+        fid = f["id"]
         coll = f["properties"]["collection"]
 
-        existing = by_scene.get(scene_id)
+        existing = by_id.get(fid)
         if existing is None:
-            by_scene[scene_id] = f
+            by_id[fid] = f
         else:
+            # Same plume id appearing in multiple collections.
+            # Prefer plumemetrics collection for emission metadata.
             if "plumemetrics" in coll and "plumemetrics" not in existing["properties"]["collection"]:
-                if existing["properties"]["emission_auto"] == 0:
+                if existing["properties"].get("emission_auto", 0) == 0 and \
+                   f["properties"].get("emission_auto", 0) > 0:
                     existing["properties"]["emission_auto"] = f["properties"]["emission_auto"]
+                existing["properties"]["collection"] = coll
+            # merge stac props
+            merged = dict(existing["properties"].get("_stac_props", {}))
+            merged.update(f["properties"].get("_stac_props", {}))
+            existing["properties"]["_stac_props"] = merged
 
     final = []
-    for f in by_scene.values():
+    for f in by_id.values():
         if f.get("geometry") is None:
             continue
         if instrument == "tan" and not f["id"].startswith("tan"):
@@ -671,35 +721,28 @@ def cm_plume_datetime(feature) -> Optional[datetime]:
 
 def cm_plume_emission(feature) -> float:
     props = feature.get("properties", {})
-    for key in ("emission_auto", "emission_rate_kg_hr", "emission_rate",
-                "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-                "emission_estimate", "emission", "ime_flux"):
-        if key in props and props[key] is not None:
-            try:
-                return float(props[key])
-            except Exception:
-                pass
+
+    # top-level properties
+    val = _extract_numeric(props, CM_EMISSION_KEYS)
+    if val is not None:
+        return val
+
+    # nested _stac_props
     stac_props = props.get("_stac_props", {})
-    for key in ("emission_rate", "emission_auto", "emission_rate_kg_hr",
-                "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-                "emission_estimate", "emission", "ime_flux"):
-        if key in stac_props and stac_props[key] is not None:
-            try:
-                return float(stac_props[key])
-            except Exception:
-                pass
+    val = _extract_numeric(stac_props, CM_EMISSION_KEYS)
+    if val is not None:
+        return val
+
     return 0.0
 
 
 def cm_plume_wind(feature) -> Optional[float]:
     props = feature.get("properties", {})
-    for key in ("wind_speed", "wind_speed_m_s"):
-        if key in props and props[key] is not None:
-            try:
-                return float(props[key])
-            except Exception:
-                pass
-    return None
+    val = _extract_numeric(props, ("wind_speed", "wind_speed_m_s"))
+    if val is not None:
+        return val
+    stac_props = props.get("_stac_props", {})
+    return _extract_numeric(stac_props, ("wind_speed", "wind_speed_m_s"))
 
 
 def find_overlap_dates(emit_results, tanager_results):
@@ -1578,7 +1621,8 @@ with control_col:
 
     if emit_results or tanager_results:
         rows = []
-        for g in emit_results:
+        # EMIT rows — keep reference to source index in emit_results
+        for i, g in enumerate(emit_results):
             dt = granule_datetime(g)
             rows.append({
                 "date": dt,
@@ -1586,8 +1630,11 @@ with control_col:
                 "resolution": "60 m",
                 "cloud": granule_cloud(g),
                 "id": g.get("meta", {}).get("native-id", "unknown")[:40],
+                "src_idx": i,
+                "src_list": "EMIT",
             })
-        for f in tanager_results:
+        # Tanager rows — keep reference to source index in tanager_results
+        for i, f in enumerate(tanager_results):
             dt = cm_plume_datetime(f)
             props = f.get("properties", {})
             rows.append({
@@ -1596,8 +1643,13 @@ with control_col:
                 "resolution": "30 m",
                 "cloud": None,
                 "id": props.get("plume_id", "unknown")[:40],
+                "src_idx": i,
+                "src_list": "Tanager-1",
             })
-        table = pd.DataFrame(rows).sort_values(["date", "satellite"], na_position="last").reset_index(drop=True)
+        table = pd.DataFrame(rows).sort_values(
+            ["date", "satellite"], na_position="last"
+        ).reset_index(drop=True)
+
         st.dataframe(
             table[["date", "satellite", "resolution", "cloud", "id"]],
             use_container_width=True,
@@ -1639,17 +1691,16 @@ with control_col:
         )
         chosen_row = table.iloc[selected_idx]
 
+        # ✅ FIX: use src_idx to find the correct source item
         if chosen_row["satellite"] == "EMIT":
-            emit_rows = table[table["satellite"] == "EMIT"].reset_index(drop=True)
-            emit_pos = emit_rows[emit_rows["id"] == chosen_row["id"]].index
-            if len(emit_pos):
-                st.session_state["selected_granule"] = emit_results[emit_pos[0]]
+            src_i = int(chosen_row["src_idx"])
+            if 0 <= src_i < len(emit_results):
+                st.session_state["selected_granule"] = emit_results[src_i]
                 st.session_state.pop("selected_tanager", None)
         else:
-            tan_rows = table[table["satellite"] == "Tanager-1"].reset_index(drop=True)
-            tan_pos = tan_rows[tan_rows["id"] == chosen_row["id"]].index
-            if len(tan_pos):
-                st.session_state["selected_tanager"] = tanager_results[tan_pos[0]]
+            src_i = int(chosen_row["src_idx"])
+            if 0 <= src_i < len(tanager_results):
+                st.session_state["selected_tanager"] = tanager_results[src_i]
                 st.session_state.pop("selected_granule", None)
 
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1923,11 +1974,13 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
     metrics[5].metric("Mean enh. (ppm·m)", f"{flux['mean_enhancement']:.0f}")
 
-    if flux.get("reported_flux_kg_h"):
+    # ✅ FIX: only show "reported flux" note when it's actually nonzero
+    _reported = flux.get("reported_flux_kg_h")
+    if _reported is not None and _reported > 0:
         st.markdown(
             f'<div class="result-note">'
             f'<b>Carbon Mapper reported flux:</b> '
-            f'{flux["reported_flux_kg_h"]:.1f} kg/h'
+            f'{_reported:.1f} kg/h'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1951,10 +2004,11 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     output_format="PNG",
                 )
             else:
+                _shown_flux = flux.get('reported_flux_kg_h') or flux['Q_kg_h']
                 st.image(
                     placeholder_png(
                         f"{sat} raster not available\n"
-                        f"Reported flux: {flux.get('reported_flux_kg_h', flux['Q_kg_h']):.1f} kg/h"
+                        f"Reported flux: {_shown_flux:.1f} kg/h"
                     ),
                     use_container_width=True,
                 )
@@ -2562,9 +2616,8 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                     wind = PARAMS["wind_speed_m_s"]
 
                                 if data is not None and data.size > 0:
+                                    # ✅ FIX: compute coverage from real data, no hardcoded 0.5
                                     cov = valid_coverage(data)
-                                    if cov < 0.02:
-                                        cov = 0.5
                                     pm = detect_plume(
                                         data,
                                         PARAMS["plume_threshold_ppm_m"],
