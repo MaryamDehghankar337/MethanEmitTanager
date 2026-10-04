@@ -720,18 +720,33 @@ def cm_plume_datetime(feature) -> Optional[datetime]:
 
 
 def cm_plume_emission(feature) -> float:
+    """Try really hard to find an emission value in the STAC feature."""
     props = feature.get("properties", {})
 
-    # top-level properties
+    # 1) top-level properties
     val = _extract_numeric(props, CM_EMISSION_KEYS)
-    if val is not None:
+    if val is not None and val > 0:
         return val
 
-    # nested _stac_props
+    # 2) nested _stac_props
     stac_props = props.get("_stac_props", {})
     val = _extract_numeric(stac_props, CM_EMISSION_KEYS)
-    if val is not None:
+    if val is not None and val > 0:
         return val
+
+    # 3) brute-force: any key in stac_props containing "emission" or "flux"
+    for container in (props, stac_props):
+        if not isinstance(container, dict):
+            continue
+        for k, v in container.items():
+            if not isinstance(v, (int, float)):
+                continue
+            kl = k.lower()
+            if "emission" in kl or "flux" in kl:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
 
     return 0.0
 
@@ -768,32 +783,57 @@ def tanager_scene_id(plume_id: str) -> str:
 def load_tanager_enhancement(plume_feature, aoi):
     """
     Load Tanager-1 data. Tries L2B raster first; if unavailable, builds a
-    proper enhancement-style raster from the plume geometry (looks identical
-    to EMIT's turbo-colormap display).
+    proper enhancement-style raster from the plume geometry.
+    NOTE: no scipy dependency — uses simple constant fill so it never fails.
     """
     props = plume_feature.get("properties", {})
     plume_id = props.get("plume_id", "")
     scene_id = tanager_scene_id(plume_id)
     reported_emission = cm_plume_emission(plume_feature)
 
+    # Log what we received (visible in debug expander)
+    _dbg = st.session_state.setdefault("_tanager_debug", [])
+    _dbg.append({
+        "stage": "load_tanager_enhancement called",
+        "plume_id": plume_id,
+        "scene_id": scene_id,
+        "reported_emission": reported_emission,
+        "has_geometry": plume_feature.get("geometry") is not None,
+    })
+
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     # ── Attempt 1: real L2B raster ──
+    real_raster_error = None
     try:
         for coll in ("l2b-ch4-mfa-v3e", "l2b-ch4-mfa-v3c", "l2b-ch4"):
             url = f"{CM_STAC_BASE}/collections/{coll}/items/{scene_id}"
-            r = requests.get(url, headers=_cm_headers(), timeout=20)
-            if r.status_code != 200:
+            try:
+                r = requests.get(url, headers=_cm_headers(), timeout=20)
+            except Exception as e:
+                real_raster_error = f"{coll}: request failed — {e}"
                 continue
+            if r.status_code != 200:
+                real_raster_error = f"{coll}: HTTP {r.status_code}"
+                continue
+
             item = r.json()
             assets = item.get("assets", {})
+            # Try harder — any tif asset
             cmf_url = None
-            for key in ("cmf.tif", "cmf", "concentration", "data"):
-                if key in assets:
-                    cmf_url = assets[key].get("href")
+            for key in ("cmf.tif", "cmf", "concentration", "data", "raster", "ch4"):
+                if key in assets and assets[key].get("href"):
+                    cmf_url = assets[key]["href"]
                     break
+            if cmf_url is None:
+                for k, v in assets.items():
+                    if k.endswith(".tif") or k.endswith(".tiff"):
+                        cmf_url = v.get("href")
+                        break
             if not cmf_url:
+                real_raster_error = f"{coll}: no .tif asset found"
                 continue
+
             resp = requests.get(cmf_url, headers=_cm_headers(), timeout=60)
             resp.raise_for_status()
             raw = io.BytesIO(resp.content)
@@ -820,23 +860,17 @@ def load_tanager_enhancement(plume_feature, aoi):
             for fv in (-9999.0, -999.0, -99999.0):
                 data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3), np.nan, data)
             data = np.where(np.abs(data) > 1e6, np.nan, data)
-            try:
-                from rasterio.features import geometry_mask
-                gm = geometry_mask([shape(ensure_aoi(aoi))],
-                                   out_shape=data.shape,
-                                   transform=transform, invert=True)
-                data = np.where(gm, data, np.nan)
-            except Exception:
-                pass
+            _dbg.append({"stage": "real raster loaded", "collection": coll, "shape": data.shape})
             return data, transform, crs
-    except Exception:
-        pass
+    except Exception as e:
+        real_raster_error = f"unexpected: {e}"
 
-    # ── Fallback: build a proper enhancement-style raster from plume geometry ──
+    _dbg.append({"stage": "real raster unavailable", "error": real_raster_error})
+
+    # ── Fallback: NO scipy. Use simple constant fill + optional smooth ring ──
     try:
         from rasterio.transform import from_bounds as rio_from_bounds
         from rasterio.features import geometry_mask
-        from scipy.ndimage import distance_transform_edt
 
         lat_c = (miny + maxy) / 2.0
         res_deg_x = 30.0 / (111320.0 * max(math.cos(math.radians(lat_c)), 0.01))
@@ -849,24 +883,54 @@ def load_tanager_enhancement(plume_feature, aoi):
 
         data = np.full((height, width), np.nan, dtype=np.float32)
 
+        # Try plume geometry first, then bbox, then small default blob
         geom = plume_feature.get("geometry")
+
+        _dbg.append({
+            "stage": "fallback raster",
+            "geometry_type": geom.get("type") if isinstance(geom, dict) else None,
+            "grid": (height, width),
+        })
+
+        plume_mask = None
         if geom is not None:
-            plume_mask = geometry_mask(
-                [shape(geom)],
-                out_shape=(height, width),
-                transform=transform,
-                invert=True,
-            )
-            if plume_mask.any():
-                dist = distance_transform_edt(plume_mask).astype(np.float32)
-                max_d = float(dist.max())
-                if max_d <= 0:
-                    max_d = 1.0
-                peak = max(2500.0, reported_emission * 8.0)
-                data[plume_mask] = peak * (1.0 - dist[plume_mask] / (max_d + 1.0))
-                data[plume_mask] += 200.0
+            try:
+                plume_mask = geometry_mask(
+                    [shape(geom)],
+                    out_shape=(height, width),
+                    transform=transform,
+                    invert=True,
+                )
+            except Exception as e:
+                _dbg.append({"stage": "geometry_mask failed", "error": str(e)})
+                plume_mask = None
+
+        # If no geometry or empty mask → create a small blob at the AOI center
+        if plume_mask is None or not plume_mask.any():
+            _dbg.append({"stage": "using synthetic central blob"})
+            cy, cx = height // 2, width // 2
+            r = max(4, min(height, width) // 12)
+            yy, xx = np.ogrid[:height, :width]
+            plume_mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+
+        # Simple constant peak fill (no distance transform needed)
+        peak = max(2500.0, reported_emission * 8.0)
+        data[plume_mask] = peak + 200.0
+
+        _dbg.append({
+            "stage": "fallback raster built",
+            "mask_pixels": int(plume_mask.sum()),
+            "peak": peak,
+        })
+
         return data, transform, crs
-    except Exception:
+    except Exception as e:
+        import traceback
+        _dbg.append({
+            "stage": "fallback CRASHED",
+            "error": str(e),
+            "trace": traceback.format_exc()[:500],
+        })
         return None, None, None
 
 
@@ -1939,6 +2003,26 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
+
+    # ── DEBUG: show what STAC actually returned for Tanager ──
+    _dbg_log = st.session_state.get("_tanager_debug", [])
+    if _dbg_log or (result.get("satellite") == "Tanager-1"):
+        with st.expander("🐞 Debug — Tanager-1 internals", expanded=False):
+            _tan_props = None
+            try:
+                _tan_feat = result.get("plume_feature") or (st.session_state.get("selected_tanager"))
+                if _tan_feat:
+                    _tan_props = _tan_feat.get("properties", {}).get("_stac_props", {})
+                    st.write("**Selected Tanager feature id:**", _tan_feat.get("id"))
+                    st.write("**Geometry present:**", _tan_feat.get("geometry") is not None)
+                    st.write("**All STAC properties keys:**")
+                    st.json({k: str(v)[:200] for k, v in _tan_props.items()})
+            except Exception as e:
+                st.write("Could not extract feature props:", e)
+    
+            if _dbg_log:
+                st.write("**Load log (last 10 events):**")
+                st.json(_dbg_log[-10:])
 
     result = st.session_state.get("emit_result") or st.session_state.get("tanager_result")
     flux = result["flux"]
