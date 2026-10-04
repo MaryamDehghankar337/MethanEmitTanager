@@ -493,18 +493,18 @@ def cm_plume_platform(plume_id: str) -> str:
 
 def search_carbonmapper_plumes(aoi, start_date, end_date,
                                gas="CH4", instrument="tan"):
-    """Search Carbon Mapper via STAC with required collections parameter."""
+    """Search Carbon Mapper via STAC with pagination and required collections."""
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
     dt_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
 
-    # ✅ اضافه کردن collections به بدنه درخواست (الزامی برای STAC search)
+    # Base search body with limit=100 (API maximum)
     body = {
         "bbox": [minx, miny, maxx, maxy],
         "datetime": datetime_range,
-        "limit": 200,
+        "limit": 100,  # ✅ API max is 100 (was 200 → caused 400 error)
         "collections": [
             "l3a-vis-ch4",
             "l3a-ime-ch4",
@@ -513,37 +513,63 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         ],
     }
 
-    try:
-        r = requests.post(
-            CM_STAC_SEARCH,
-            json=body,
-            headers=_cm_headers(),
-            timeout=60,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except requests.exceptions.HTTPError as e:
-        if r.status_code == 401:
-            raise RuntimeError(
-                "Carbon Mapper token is invalid or expired. "
-                "Please create a new token at https://data.carbonmapper.org"
-            )
-        # ✅ چاپ پاسخ کامل سرور برای دیباگ
-        raise RuntimeError(
-            f"Carbon Mapper STAC search failed: {e}\n"
-            f"Server response: {r.text[:500]}"
-        )
-    except Exception as e:
-        raise RuntimeError(f"Carbon Mapper STAC search failed: {e}")
+    all_items = []
+    url = CM_STAC_SEARCH
+    current_body = dict(body)
 
-    items = data.get("features", [])
-    if not items:
+    # Paginate through all result pages
+    for _ in range(20):  # safety cap
+        try:
+            r = requests.post(
+                url,
+                json=current_body,
+                headers=_cm_headers(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 401:
+                raise RuntimeError(
+                    "Carbon Mapper token is invalid or expired. "
+                    "Please create a new token at https://data.carbonmapper.org"
+                )
+            raise RuntimeError(
+                f"Carbon Mapper STAC search failed: {e}\n"
+                f"Server response: {r.text[:500]}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Carbon Mapper STAC search failed: {e}")
+
+        items = data.get("features", [])
+        if not items:
+            break
+        all_items.extend(items)
+
+        # Find next-page link
+        next_link = None
+        for link in data.get("links", []):
+            if link.get("rel") == "next":
+                next_link = link
+                break
+
+        if next_link is None:
+            break
+
+        # Next page is a POST with merged body
+        if next_link.get("method") != "POST":
+            break
+        url = next_link.get("href", CM_STAC_SEARCH)
+        current_body = {**body, **next_link.get("body", {})}
+
+    if not all_items:
         return []
 
+    # ── Filter to plume collections ──
     keep_prefixes = ("l3a-vis-ch4", "l3a-ime-ch4", "l3b-plumemetrics-ch4")
 
     features = []
-    for item in items:
+    for item in all_items:
         coll = item.get("collection", "")
         if not any(coll.startswith(p) for p in keep_prefixes):
             continue
@@ -555,7 +581,9 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         dt = None
         if dt_str:
             try:
-                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                dt = datetime.fromisoformat(
+                    dt_str.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
             except Exception:
                 pass
         if dt is None:
@@ -603,7 +631,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         }
         features.append(feature)
 
-    # Deduplicate by scene_id
+    # ── Deduplicate by scene_id ──
     by_scene = {}
     for f in features:
         raw_id = f["id"]
