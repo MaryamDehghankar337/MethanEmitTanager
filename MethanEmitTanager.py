@@ -312,9 +312,7 @@ def get_carbonmapper_token() -> Optional[str]:
 def _cm_headers() -> dict:
     token = get_carbonmapper_token()
     if not token:
-        raise RuntimeError(
-            "Carbon Mapper token is not set. Please enter your token in the search panel."
-        )
+        raise RuntimeError("Carbon Mapper token is not set.")
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -473,7 +471,6 @@ def _extract_numeric(props: dict, keys) -> Optional[float]:
 
 
 def cm_native_value(feature, keys) -> Optional[float]:
-    """Extract a Carbon Mapper native numeric value (handles cm: prefixes)."""
     if feature is None:
         return None
     props = feature.get("properties", {})
@@ -491,17 +488,14 @@ def cm_native_value(feature, keys) -> Optional[float]:
 
 
 def cm_plume_threshold(feature) -> Optional[float]:
-    """CM-recommended enhancement threshold (ppm·m)."""
     return cm_native_value(feature, ("cm:threshold", "threshold"))
 
 
 def cm_plume_ime(feature) -> Optional[float]:
-    """CM-integrated methane enhancement (kg)."""
     return cm_native_value(feature, ("cm:ime", "ime"))
 
 
 def cm_plume_fetch(feature) -> Optional[float]:
-    """CM-plume fetch length (m)."""
     return cm_native_value(feature, ("cm:fetch", "fetch"))
 
 
@@ -509,12 +503,7 @@ def cm_plume_sum_pix(feature) -> Optional[float]:
     return cm_native_value(feature, ("cm:sum_pix", "sum_pix"))
 
 
-def cm_plume_pixres(feature) -> Optional[float]:
-    return cm_native_value(feature, ("cm:pixres", "pixres"))
-
-
 def cm_plume_centroid(feature):
-    """CM's reported plume centroid as (lon, lat)."""
     lat = cm_native_value(feature, ("cm:plume:latitude", "cm:plume_latitude"))
     lon = cm_native_value(feature, ("cm:plume:longitude", "cm:plume_longitude"))
     if lat is not None and lon is not None:
@@ -550,10 +539,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
             data = r.json()
         except requests.exceptions.HTTPError as e:
             if r.status_code == 401:
-                raise RuntimeError(
-                    "Carbon Mapper token is invalid or expired. "
-                    "Please create a new token at https://data.carbonmapper.org"
-                )
+                raise RuntimeError("Carbon Mapper token is invalid or expired.")
             raise RuntimeError(
                 f"Carbon Mapper STAC search failed: {e}\n"
                 f"Server response: {r.text[:500]}"
@@ -611,8 +597,6 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
             if bb and len(bb) == 4:
                 geom = mapping(box(bb[0], bb[1], bb[2], bb[3]))
 
-        cm_threshold = props.get("cm:threshold") or props.get("threshold")
-
         feature = {
             "type": "Feature",
             "id": item_id,
@@ -624,13 +608,13 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
                 "wind_speed": wind,
                 "collection": coll,
                 "instrument": props.get("instrument", "tan"),
-                "cm_threshold": cm_threshold,
+                "cm_threshold": props.get("cm:threshold") or props.get("threshold"),
                 "_stac_props": props,
             },
         }
         features.append(feature)
 
-    # Deduplicate by FULL plume_id (preserves multiple plumes per scene)
+    # Deduplicate by FULL plume_id
     by_id = {}
     for f in features:
         fid = f["id"]
@@ -680,11 +664,9 @@ def cm_plume_wind(feature) -> Optional[float]:
 
 
 def cm_plume_emission(feature) -> float:
-    """Get emission rate (kg/h). Uses CM native formula: Q = U × IME / fetch."""
     props = feature.get("properties", {})
     stac_props = props.get("_stac_props", {})
 
-    # 1) Direct emission keys
     val = _extract_numeric(props, CM_EMISSION_KEYS)
     if val is not None and val > 0:
         return val
@@ -692,7 +674,6 @@ def cm_plume_emission(feature) -> float:
     if val is not None and val > 0:
         return val
 
-    # 2) CM native formula: Q = U_eff × IME / fetch
     ime = cm_plume_ime(feature)
     fetch = cm_plume_fetch(feature)
     if ime is not None and ime > 0 and fetch is not None and fetch > 0:
@@ -702,7 +683,6 @@ def cm_plume_emission(feature) -> float:
         q_kg_s = u * ime / fetch
         return q_kg_s * 3600.0
 
-    # 3) Brute-force fallback
     for container in (props, stac_props):
         if not isinstance(container, dict):
             continue
@@ -919,7 +899,6 @@ def load_tanager_enhancement(plume_feature, aoi):
     _dbg.append({"stage": "real raster unavailable, using fallback",
                  "error": real_raster_error})
 
-    # Fallback: synthetic raster
     try:
         from rasterio.transform import from_bounds as rio_from_bounds2
         from rasterio.features import geometry_mask
@@ -1256,7 +1235,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 [data-testid="stImage"] { max-width: 100% !important; overflow: hidden; border-radius: 6px; }
 [data-testid="stImage"] > img { max-width: 100% !important; height: auto !important; display: block; }
 .auth-card { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 11px; padding: 0.65rem 0.75rem; margin-top: 0.45rem; }
-.auth-status { background: #e8f7ea; border: 1px solid #9ed2a4; color: #155724 !important; border-radius: 9px; padding: 0.45rem 0.6rem; font-size: 0.76rem; font-weight: 700; margin-bottom: 0.45rem; }
 .auth-help { color: #111111 !important; font-size: 0.72rem; line-height: 1.45; margin: 0.2rem 0 0.45rem 0; }
 div[data-testid="stDataFrame"] { border: 1px solid var(--border); }
 div[data-testid="stDataFrame"] * { color: #111111 !important; }
@@ -1507,6 +1485,22 @@ with control_col:
     tanager_results = search_results.get("Tanager-1", [])
 
     if emit_results or tanager_results:
+        # ── Tanager-1 search diagnostics ──
+        if tanager_results:
+            with st.expander(f"🔍 Tanager-1 search diagnostics ({len(tanager_results)} plumes)",
+                             expanded=False):
+                _id_map = {}
+                for f in tanager_results:
+                    pid = f.get("properties", {}).get("plume_id", "")
+                    scene = pid.rsplit("-", 1)[0] if "-" in pid else pid
+                    _id_map.setdefault(scene, []).append(pid)
+                st.write(f"**Total Tanager plumes found:** {len(tanager_results)}")
+                st.write(f"**Unique scenes:** {len(_id_map)}")
+                for scene, plumes in _id_map.items():
+                    st.write(f"**Scene `{scene}`** → {len(plumes)} plume(s):")
+                    for p in plumes:
+                        st.write(f"  - `{p}`")
+
         rows = []
         for i, g in enumerate(emit_results):
             dt = granule_datetime(g)
@@ -1700,8 +1694,6 @@ with action_col:
 
                     if has_raster:
                         progress.progress(70, text="Detecting plumes…")
-
-                        # ✅ Auto threshold from Carbon Mapper STAC
                         _cm_thr = cm_plume_threshold(selected_tanager)
                         if _cm_thr is not None and _cm_thr > 0:
                             threshold_to_use = _cm_thr
@@ -1717,7 +1709,6 @@ with action_col:
                         plume_mask = detect_plume(data, threshold_to_use,
                                                   int(PARAMS["min_plume_pixels"]))
 
-                        # ✅ Keep only the connected component nearest to CM's reported plume
                         n_before = int(plume_mask.sum())
                         plume_mask = filter_to_cm_plume_component(
                             plume_mask, transform, selected_tanager, crs)
@@ -1832,7 +1823,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
     metrics[5].metric("Mean enh. (ppm·m)", f"{flux['mean_enhancement']:.0f}")
 
-    # ✅ Carbon Mapper native values (Tanager only)
     if sat == "Tanager-1" and flux.get("cm_ime") is not None:
         _parts = []
         if flux.get("cm_ime") is not None:
@@ -2015,7 +2005,7 @@ if emit_results or tanager_results:
                     data, tform, tcrs = load_emit_enhancement(
                         item, st.session_state.aoi,
                         resolution=SATELLITES["EMIT"]["resolution"])
-                    if data is None or data.size == 0 or valid_coverage(data) < 0.02:
+                    if data is None or data.size == 0 or valid_coverage(data) < 0.10:
                         continue
                     g_dt = granule_datetime(item)
                     wind = get_wind_speed_openmeteo(_centroid_batch.y, _centroid_batch.x, g_dt) if g_dt else None
@@ -2091,7 +2081,12 @@ if emit_results or tanager_results:
             pivot = chart_df.pivot_table(index="date", columns="satellite",
                                           values="flux_kg_h", aggfunc="first")
             st.markdown("##### Estimated flux over time (EMIT vs Tanager-1)")
-            st.line_chart(pivot, use_container_width=True, height=240)
+            # ✅ Use scatter for < 3 points (line interpolation meaningless)
+            if len(chart_df) >= 3:
+                st.line_chart(pivot, use_container_width=True, height=240)
+            else:
+                st.scatter_chart(pivot, use_container_width=True, height=240)
+                st.caption(f"⚠️ Only {len(chart_df)} observations — line interpolation not meaningful.")
             st.dataframe(chart_df.set_index("date"), use_container_width=True, hide_index=False,
                          column_config={
                              "satellite": st.column_config.TextColumn("Satellite"),
@@ -2259,7 +2254,11 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                             if sat == "EMIT":
                                 res = SATELLITES["EMIT"]["resolution"]
                                 data, tform, tcrs = load_emit_enhancement(item, st.session_state.aoi, resolution=res)
-                                if data is None or data.size == 0 or valid_coverage(data) < 0.02:
+                                if data is None or data.size == 0:
+                                    continue
+                                cov = valid_coverage(data)
+                                # ✅ Skip scenes with insufficient coverage (< 10%)
+                                if cov < 0.10:
                                     continue
                                 g_dt = granule_datetime(item)
                                 wind = get_wind_speed_openmeteo(_centroid_evo.y, _centroid_evo.x, g_dt) if g_dt else None
@@ -2268,7 +2267,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                 pm = detect_plume(data, PARAMS["plume_threshold_ppm_m"],
                                                   int(PARAMS["min_plume_pixels"]))
                                 f = estimate_flux_ime(data, pm, wind, resolution=res)
-                                has_raster = True; reported = None; cov = valid_coverage(data)
+                                has_raster = True; reported = None
                             else:
                                 res = SATELLITES["Tanager-1"]["resolution"]
                                 data, tform, tcrs = load_tanager_enhancement(item, st.session_state.aoi)
@@ -2374,13 +2373,23 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
             if not evo_df.empty and evo_df["date"].notna().any():
                 evo_df = evo_df.sort_values("date").set_index("date")
                 st.markdown("##### Flux evolution")
-                st.line_chart(evo_df.reset_index().pivot_table(
-                    index="date", columns="satellite", values="flux_kg_h", aggfunc="first"),
-                    use_container_width=True, height=220)
+                _evo_pivot = evo_df.reset_index().pivot_table(
+                    index="date", columns="satellite", values="flux_kg_h", aggfunc="first")
+                # ✅ Use scatter for < 3 points
+                if len(evo_df) >= 3:
+                    st.line_chart(_evo_pivot, use_container_width=True, height=220)
+                else:
+                    st.scatter_chart(_evo_pivot, use_container_width=True, height=220)
+                    st.caption(f"⚠️ Only {len(evo_df)} observations — line interpolation not meaningful.")
+
                 st.markdown("##### Plume area evolution")
-                st.line_chart(evo_df.reset_index().pivot_table(
-                    index="date", columns="satellite", values="plume_area_km2", aggfunc="first"),
-                    use_container_width=True, height=200)
+                _area_pivot = evo_df.reset_index().pivot_table(
+                    index="date", columns="satellite", values="plume_area_km2", aggfunc="first")
+                if len(evo_df) >= 3:
+                    st.line_chart(_area_pivot, use_container_width=True, height=200)
+                else:
+                    st.scatter_chart(_area_pivot, use_container_width=True, height=200)
+
                 st.dataframe(evo_df, use_container_width=True, hide_index=False,
                              column_config={
                                  "satellite": st.column_config.TextColumn("Satellite"),
