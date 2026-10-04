@@ -88,7 +88,6 @@ CM_PLATFORM_MAP = {
     "gao": "GAO",
 }
 
-# Carbon Mapper STAC emission-related keys (expanded)
 CM_EMISSION_KEYS = (
     "emission_rate",
     "emission_auto",
@@ -494,25 +493,16 @@ def load_emit_enhancement(granule, aoi, resolution=60):
 # ══════════════════════════════════════════════════════════════════════
 
 def parse_cm_plume_datetime(plume_id: str) -> Optional[datetime]:
-    """Parse datetime from a Carbon Mapper plume/scene id.
-
-    Handles ids like:
-        tan20260803t083659c56s4001-A
-        tan20260803t083659c56s4001
-        emit20250101t120000...
-    """
     if not plume_id:
         return None
     try:
         for prefix in CM_PLATFORM_MAP:
             if plume_id.startswith(prefix):
                 rest = plume_id[len(prefix):]
-                # Find first 't' followed by 6 digits
                 for i in range(len(rest) - 6):
                     if rest[i] == "t" and rest[i+1:i+7].isdigit():
-                        ts = rest[:i+7]  # e.g. 20260803t083659
+                        ts = rest[:i+7]
                         return datetime.strptime(ts, "%Y%m%dT%H%M%S")
-                # Fallback: assume first 15 chars
                 if len(rest) >= 15:
                     ts = rest[:15]
                     return datetime.strptime(ts, "%Y%m%dT%H%M%S")
@@ -529,21 +519,14 @@ def cm_plume_platform(plume_id: str) -> str:
 
 
 def _extract_numeric(props: dict, keys) -> Optional[float]:
-    """Try to extract a numeric value from props using a list of keys.
-    Also searches inside nested dicts (e.g. props['properties']) as fallback.
-    """
     if not isinstance(props, dict):
         return None
-
-    # direct lookup
     for key in keys:
         if key in props and props[key] is not None:
             try:
                 return float(props[key])
             except (TypeError, ValueError):
                 pass
-
-    # nested lookup (one level deep) — some STAC impls nest under 'properties'
     for nested_key in ("properties", "stac_properties", "cm_properties", "assets_meta"):
         nested = props.get(nested_key)
         if isinstance(nested, dict):
@@ -553,13 +536,11 @@ def _extract_numeric(props: dict, keys) -> Optional[float]:
                         return float(nested[key])
                     except (TypeError, ValueError):
                         pass
-
     return None
 
 
 def search_carbonmapper_plumes(aoi, start_date, end_date,
                                gas="CH4", instrument="tan"):
-    """Search Carbon Mapper via STAC with pagination and required collections."""
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
@@ -674,7 +655,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         }
         features.append(feature)
 
-    # ── Deduplicate by FULL plume_id (preserves multiple plumes per scene) ──
+    # Deduplicate by FULL plume_id (preserves multiple plumes per scene)
     by_id = {}
     for f in features:
         fid = f["id"]
@@ -684,14 +665,11 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         if existing is None:
             by_id[fid] = f
         else:
-            # Same plume id appearing in multiple collections.
-            # Prefer plumemetrics collection for emission metadata.
             if "plumemetrics" in coll and "plumemetrics" not in existing["properties"]["collection"]:
                 if existing["properties"].get("emission_auto", 0) == 0 and \
                    f["properties"].get("emission_auto", 0) > 0:
                     existing["properties"]["emission_auto"] = f["properties"]["emission_auto"]
                 existing["properties"]["collection"] = coll
-            # merge stac props
             merged = dict(existing["properties"].get("_stac_props", {}))
             merged.update(f["properties"].get("_stac_props", {}))
             existing["properties"]["_stac_props"] = merged
@@ -720,21 +698,17 @@ def cm_plume_datetime(feature) -> Optional[datetime]:
 
 
 def cm_plume_emission(feature) -> float:
-    """Try really hard to find an emission value in the STAC feature."""
     props = feature.get("properties", {})
 
-    # 1) top-level properties
     val = _extract_numeric(props, CM_EMISSION_KEYS)
     if val is not None and val > 0:
         return val
 
-    # 2) nested _stac_props
     stac_props = props.get("_stac_props", {})
     val = _extract_numeric(stac_props, CM_EMISSION_KEYS)
     if val is not None and val > 0:
         return val
 
-    # 3) brute-force: any key in stac_props containing "emission" or "flux"
     for container in (props, stac_props):
         if not isinstance(container, dict):
             continue
@@ -782,17 +756,17 @@ def tanager_scene_id(plume_id: str) -> str:
 
 def load_tanager_enhancement(plume_feature, aoi):
     """
-    Load Tanager-1 data. Tries L2B raster first; if unavailable, builds a
-    proper enhancement-style raster from the plume geometry.
-    NOTE: no scipy dependency — uses simple constant fill so it never fails.
+    Load Tanager-1 data. Tries L2B raster first; if unavailable or empty,
+    builds an enhancement-style raster from the plume geometry.
     """
     props = plume_feature.get("properties", {})
     plume_id = props.get("plume_id", "")
     scene_id = tanager_scene_id(plume_id)
     reported_emission = cm_plume_emission(plume_feature)
 
-    # Log what we received (visible in debug expander)
-    _dbg = st.session_state.setdefault("_tanager_debug", [])
+    if "_tanager_debug" not in st.session_state:
+        st.session_state["_tanager_debug"] = []
+    _dbg = st.session_state["_tanager_debug"]
     _dbg.append({
         "stage": "load_tanager_enhancement called",
         "plume_id": plume_id,
@@ -806,6 +780,9 @@ def load_tanager_enhancement(plume_feature, aoi):
     # ── Attempt 1: real L2B raster ──
     real_raster_error = None
     try:
+        from rasterio.warp import transform_bounds
+        from rasterio.windows import from_bounds as rio_from_bounds
+
         for coll in ("l2b-ch4-mfa-v3e", "l2b-ch4-mfa-v3c", "l2b-ch4"):
             url = f"{CM_STAC_BASE}/collections/{coll}/items/{scene_id}"
             try:
@@ -819,7 +796,6 @@ def load_tanager_enhancement(plume_feature, aoi):
 
             item = r.json()
             assets = item.get("assets", {})
-            # Try harder — any tif asset
             cmf_url = None
             for key in ("cmf.tif", "cmf", "concentration", "data", "raster", "ch4"):
                 if key in assets and assets[key].get("href"):
@@ -837,20 +813,51 @@ def load_tanager_enhancement(plume_feature, aoi):
             resp = requests.get(cmf_url, headers=_cm_headers(), timeout=60)
             resp.raise_for_status()
             raw = io.BytesIO(resp.content)
+
             with rasterio.open(raw) as src:
                 nodata = src.nodata
+                src_crs = src.crs
+
                 try:
-                    from rasterio.windows import from_bounds
-                    window = from_bounds(minx, miny, maxx, maxy, src.transform)
+                    b = transform_bounds("EPSG:4326", src_crs,
+                                         minx, miny, maxx, maxy,
+                                         densify_pts=21)
+                    w_minx, w_miny, w_maxx, w_maxy = b
+                except Exception as e:
+                    _dbg.append({"stage": "transform_bounds failed",
+                                 "error": str(e),
+                                 "raster_crs": str(src_crs)})
+                    w_minx, w_miny, w_maxx, w_maxy = minx, miny, maxx, maxy
+
+                _dbg.append({
+                    "stage": "computing window",
+                    "raster_crs": str(src_crs),
+                    "aoi_ll": [minx, miny, maxx, maxy],
+                    "aoi_proj": [w_minx, w_miny, w_maxx, w_maxy],
+                    "raster_bounds": list(src.bounds),
+                })
+
+                try:
+                    window = rio_from_bounds(w_minx, w_miny, w_maxx, w_maxy, src.transform)
                     window = window.round_offsets().round_lengths()
                     data = src.read(1, window=window)
                     transform = src.window_transform(window)
                     crs = src.crs
-                except Exception:
+                except Exception as e:
+                    _dbg.append({"stage": "window read failed", "error": str(e)})
                     data = src.read(1)
                     transform = src.transform
                     crs = src.crs
+
             data = data.astype(np.float32)
+
+            if data.size == 0:
+                real_raster_error = f"{coll}: window empty (shape {data.shape})"
+                _dbg.append({"stage": "empty window, skipping",
+                             "collection": coll,
+                             "shape": list(data.shape)})
+                continue
+
             if nodata is not None:
                 try:
                     nd = float(nodata)
@@ -860,16 +867,46 @@ def load_tanager_enhancement(plume_feature, aoi):
             for fv in (-9999.0, -999.0, -99999.0):
                 data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3), np.nan, data)
             data = np.where(np.abs(data) > 1e6, np.nan, data)
-            _dbg.append({"stage": "real raster loaded", "collection": coll, "shape": data.shape})
+
+            try:
+                from rasterio.features import geometry_mask
+                from rasterio.warp import transform_geom
+                aoi_geom = shape(ensure_aoi(aoi))
+                if crs is not None and str(crs) != "EPSG:4326":
+                    aoi_dict = transform_geom("EPSG:4326", crs, mapping(aoi_geom))
+                    aoi_geom_use = shape(aoi_dict)
+                else:
+                    aoi_geom_use = aoi_geom
+                gm = geometry_mask([aoi_geom_use],
+                                   out_shape=data.shape,
+                                   transform=transform, invert=True)
+                data = np.where(gm, data, np.nan)
+            except Exception:
+                pass
+
+            if np.isfinite(data).sum() == 0:
+                real_raster_error = f"{coll}: all pixels NaN after masking"
+                _dbg.append({"stage": "all NaN after mask", "collection": coll})
+                continue
+
+            _dbg.append({"stage": "real raster loaded OK",
+                         "collection": coll,
+                         "shape": list(data.shape),
+                         "valid_px": int(np.isfinite(data).sum())})
             return data, transform, crs
     except Exception as e:
+        import traceback
         real_raster_error = f"unexpected: {e}"
+        _dbg.append({"stage": "real raster exception",
+                     "error": str(e),
+                     "trace": traceback.format_exc()[:400]})
 
-    _dbg.append({"stage": "real raster unavailable", "error": real_raster_error})
+    _dbg.append({"stage": "real raster unavailable, using fallback",
+                 "error": real_raster_error})
 
-    # ── Fallback: NO scipy. Use simple constant fill + optional smooth ring ──
+    # ── Fallback: synthetic raster from plume geometry ──
     try:
-        from rasterio.transform import from_bounds as rio_from_bounds
+        from rasterio.transform import from_bounds as rio_from_bounds2
         from rasterio.features import geometry_mask
 
         lat_c = (miny + maxy) / 2.0
@@ -878,18 +915,16 @@ def load_tanager_enhancement(plume_feature, aoi):
         width = max(60, min(600, int((maxx - minx) / res_deg_x)))
         height = max(60, min(600, int((maxy - miny) / res_deg_y)))
 
-        transform = rio_from_bounds(minx, miny, maxx, maxy, width, height)
+        transform = rio_from_bounds2(minx, miny, maxx, maxy, width, height)
         crs = "EPSG:4326"
 
         data = np.full((height, width), np.nan, dtype=np.float32)
-
-        # Try plume geometry first, then bbox, then small default blob
         geom = plume_feature.get("geometry")
 
         _dbg.append({
             "stage": "fallback raster",
             "geometry_type": geom.get("type") if isinstance(geom, dict) else None,
-            "grid": (height, width),
+            "grid": [height, width],
         })
 
         plume_mask = None
@@ -905,7 +940,6 @@ def load_tanager_enhancement(plume_feature, aoi):
                 _dbg.append({"stage": "geometry_mask failed", "error": str(e)})
                 plume_mask = None
 
-        # If no geometry or empty mask → create a small blob at the AOI center
         if plume_mask is None or not plume_mask.any():
             _dbg.append({"stage": "using synthetic central blob"})
             cy, cx = height // 2, width // 2
@@ -913,7 +947,6 @@ def load_tanager_enhancement(plume_feature, aoi):
             yy, xx = np.ogrid[:height, :width]
             plume_mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
 
-        # Simple constant peak fill (no distance transform needed)
         peak = max(2500.0, reported_emission * 8.0)
         data[plume_mask] = peak + 200.0
 
@@ -1283,7 +1316,6 @@ div[data-baseweb="popover"] [role="option"]:hover, div[data-baseweb="popover"] l
 [data-baseweb="calendar"] *, [data-baseweb="popover"] [data-baseweb="calendar"] *, [data-baseweb="calendar"] button { color: #ffffff !important; }
 input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus { -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
 
-/* BUTTONS */
 .stButton > button, .stDownloadButton > button {
     border-radius: 9px;
     min-height: 2.15rem;
@@ -1554,7 +1586,6 @@ with control_col:
         unsafe_allow_html=True,
     )
 
-    # Carbon Mapper token input
     if "Tanager-1" in satellite_choice:
         st.markdown("---")
         st.markdown(
@@ -1666,6 +1697,7 @@ with control_col:
             st.session_state.pop("selected_tanager", None)
             st.session_state.pop("emit_result", None)
             st.session_state.pop("tanager_result", None)
+            st.session_state.pop("_tanager_debug", None)
 
             n_emit = len(results.get("EMIT", []))
             n_tan = len(results.get("Tanager-1", []))
@@ -1685,7 +1717,6 @@ with control_col:
 
     if emit_results or tanager_results:
         rows = []
-        # EMIT rows — keep reference to source index in emit_results
         for i, g in enumerate(emit_results):
             dt = granule_datetime(g)
             rows.append({
@@ -1697,7 +1728,6 @@ with control_col:
                 "src_idx": i,
                 "src_list": "EMIT",
             })
-        # Tanager rows — keep reference to source index in tanager_results
         for i, f in enumerate(tanager_results):
             dt = cm_plume_datetime(f)
             props = f.get("properties", {})
@@ -1755,7 +1785,6 @@ with control_col:
         )
         chosen_row = table.iloc[selected_idx]
 
-        # ✅ FIX: use src_idx to find the correct source item
         if chosen_row["satellite"] == "EMIT":
             src_i = int(chosen_row["src_idx"])
             if 0 <= src_i < len(emit_results):
@@ -1913,6 +1942,9 @@ with action_col:
                     reported_flux = cm_plume_emission(selected_tanager)
                     cm_wind = cm_plume_wind(selected_tanager)
 
+                    # Reset debug log for a fresh run
+                    st.session_state["_tanager_debug"] = []
+
                     data, transform, crs = load_tanager_enhancement(
                         selected_tanager, st.session_state.aoi
                     )
@@ -2004,26 +2036,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
 
-    # ── DEBUG: show what STAC actually returned for Tanager ──
-    _dbg_log = st.session_state.get("_tanager_debug", [])
-    if _dbg_log or (result.get("satellite") == "Tanager-1"):
-        with st.expander("🐞 Debug — Tanager-1 internals", expanded=False):
-            _tan_props = None
-            try:
-                _tan_feat = result.get("plume_feature") or (st.session_state.get("selected_tanager"))
-                if _tan_feat:
-                    _tan_props = _tan_feat.get("properties", {}).get("_stac_props", {})
-                    st.write("**Selected Tanager feature id:**", _tan_feat.get("id"))
-                    st.write("**Geometry present:**", _tan_feat.get("geometry") is not None)
-                    st.write("**All STAC properties keys:**")
-                    st.json({k: str(v)[:200] for k, v in _tan_props.items()})
-            except Exception as e:
-                st.write("Could not extract feature props:", e)
-    
-            if _dbg_log:
-                st.write("**Load log (last 10 events):**")
-                st.json(_dbg_log[-10:])
-
+    # ── IMPORTANT: define `result` FIRST, before anything uses it ──
     result = st.session_state.get("emit_result") or st.session_state.get("tanager_result")
     flux = result["flux"]
     enhancement = result["enhancement"]
@@ -2033,6 +2046,36 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     sat = result.get("satellite", "EMIT")
     res = result.get("resolution", 60)
     has_raster = result.get("has_raster", enhancement is not None and enhancement.size > 0)
+
+    # ── DEBUG: show what STAC actually returned for Tanager ──
+    if sat == "Tanager-1":
+        _dbg_log = st.session_state.get("_tanager_debug", [])
+        with st.expander("🐞 Debug — Tanager-1 internals", expanded=(not has_raster)):
+            st.write(f"**has_raster:** {has_raster}")
+            if enhancement is not None:
+                st.write(f"**enhancement shape:** {enhancement.shape}")
+                if enhancement.size > 0:
+                    st.write(f"**valid pixels:** {int(np.isfinite(enhancement).sum())}")
+            else:
+                st.write("**enhancement:** None")
+
+            st.write("**Load log:**")
+            if _dbg_log:
+                for i, ev in enumerate(_dbg_log):
+                    st.write(f"`{i+1}.` {ev}")
+            else:
+                st.warning("⚠️ Debug log EMPTY — load_tanager_enhancement was never called!")
+
+            _tan_feat = result.get("plume_feature") or st.session_state.get("selected_tanager")
+            if _tan_feat:
+                st.write("**Feature id:**", _tan_feat.get("id"))
+                st.write("**Has geometry:**", _tan_feat.get("geometry") is not None)
+                _stac = _tan_feat.get("properties", {}).get("_stac_props", {})
+                st.write(f"**STAC properties ({len(_stac)} keys):**")
+                if _stac:
+                    st.json({k: str(v)[:150] for k, v in _stac.items()})
+                else:
+                    st.error("STAC properties EMPTY — search didn't receive real props!")
 
     if has_raster and enhancement is not None and enhancement.size > 0:
         vmin_enh, vmax_enh = _compute_vrange(enhancement)
@@ -2058,7 +2101,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
     metrics[5].metric("Mean enh. (ppm·m)", f"{flux['mean_enhancement']:.0f}")
 
-    # ✅ FIX: only show "reported flux" note when it's actually nonzero
     _reported = flux.get("reported_flux_kg_h")
     if _reported is not None and _reported > 0:
         st.markdown(
@@ -2153,7 +2195,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
             unsafe_allow_html=True,
         )
 
-    # Downloads
     st.markdown("#### 📥 Download results")
     dt_str = result.get("granule_dt")
     dt_tag = dt_str.strftime("%Y%m%d") if dt_str else "granule"
@@ -2700,7 +2741,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                     wind = PARAMS["wind_speed_m_s"]
 
                                 if data is not None and data.size > 0:
-                                    # ✅ FIX: compute coverage from real data, no hardcoded 0.5
                                     cov = valid_coverage(data)
                                     pm = detect_plume(
                                         data,
