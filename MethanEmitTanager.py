@@ -2,6 +2,8 @@
 
 Carbon Mapper-style methane detection on NASA EMIT and Planet Tanager-1
 hyperspectral data with side-by-side comparison mode.
+
+Users enter their own Carbon Mapper API token via a password field.
 UI/design preserved from the original Sentinel-2/EMIT app.
 """
 from __future__ import annotations
@@ -37,22 +39,21 @@ except ImportError:
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
-# ── Satellite definitions ──
 SATELLITES = {
     "EMIT": {
         "label": "EMIT (NASA)",
-        "resolution": 60,          # native pixel size (m)
+        "resolution": 60,
         "collection": "EMITL2BCH4ENH",
         "source": "earthaccess",
-        "color": "#457b9d",        # blue (existing theme)
+        "color": "#457b9d",
         "icon": "🛰️",
     },
     "Tanager-1": {
         "label": "Tanager-1 (Planet/Carbon Mapper)",
-        "resolution": 30,          # native pixel size (m)
+        "resolution": 30,
         "collection": "l2b-ch4-mfa-v3a",
         "source": "carbonmapper",
-        "color": "#e63946",        # red (existing theme)
+        "color": "#e63946",
         "icon": "📡",
     },
 }
@@ -64,13 +65,13 @@ CM_STAC_BASE = f"{CM_API_BASE}/stac"
 
 DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
 
-EMIT_ENH_COLLECTION = "EMITL2BCH4ENH"   # Methane Enhancement (ppm·m)
-EMIT_PLM_COLLECTION = "EMITL2BCH4PLM"   # Plume Complexes
+EMIT_ENH_COLLECTION = "EMITL2BCH4ENH"
+EMIT_PLM_COLLECTION = "EMITL2BCH4PLM"
 
 PARAMS = {
     "plume_threshold_ppm_m": 1000.0,
     "min_plume_pixels": 10,
-    "wind_speed_m_s": 2.0,  # Default fallback value
+    "wind_speed_m_s": 2.0,
     "max_plume_area_km2": 100.0,
 }
 
@@ -79,7 +80,6 @@ ALPHA_IME = 0.33
 BETA_IME = 0.45
 CH4_DENSITY_KG_M3 = 0.717
 
-# Carbon Mapper plume platform prefixes
 CM_PLATFORM_MAP = {
     "tan": "Tanager-1",
     "emi": "EMIT",
@@ -135,7 +135,6 @@ def compute_zoom(bounds):
 
 
 def create_map(aoi, extra_layers=None):
-    """Build Folium map. ``extra_layers`` can hold GeoJSON overlays."""
     geometry = shape(ensure_aoi(aoi))
     centroid = geometry.centroid
     zoom = compute_zoom(geometry.bounds)
@@ -233,11 +232,6 @@ def geocode_place(query: str):
 # ══════════════════════════════════════════════════════════════════════
 
 def get_wind_speed_openmeteo(lat: float, lon: float, dt: datetime) -> Optional[float]:
-    """Fetch 10m wind speed (m/s) from Open-Meteo archive for a given point & time.
-
-    Uses ERA5 reanalysis (free, no API key). Returns the wind speed
-    at the closest hour to ``dt``, or ``None`` on failure.
-    """
     try:
         url = "https://archive-api.open-meteo.com/v1/archive"
         date_str = dt.strftime("%Y-%m-%d")
@@ -290,18 +284,40 @@ def get_wind_speed_openmeteo(lat: float, lon: float, dt: datetime) -> Optional[f
 # ══════════════════════════════════════════════════════════════════════
 
 def login_earthdata():
+    """Login to NASA Earthdata.
+
+    Tries Streamlit secrets first, then environment variables.
+    """
     if not EARTHACCESS_AVAILABLE:
         raise RuntimeError(
             "Package 'earthaccess' is not installed. "
             "Please check requirements.txt."
         )
+
+    username = None
+    password = None
+
     try:
-        username = st.secrets["EARTHDATA_USERNAME"]
-        password = st.secrets["EARTHDATA_PASSWORD"]
-    except (KeyError, FileNotFoundError):
+        username = st.secrets.get("EARTHDATA_USERNAME")
+        password = st.secrets.get("EARTHDATA_PASSWORD")
+    except Exception:
+        pass
+
+    if not username:
+        username = os.environ.get("EARTHDATA_USERNAME")
+    if not password:
+        password = os.environ.get("EARTHDATA_PASSWORD")
+
+    if not username or not password:
         raise RuntimeError(
-            "Earthdata credentials are not configured. "
-            "Add EARTHDATA_USERNAME and EARTHDATA_PASSWORD to Streamlit secrets."
+            "Earthdata credentials not found.\n\n"
+            "**Fix options:**\n"
+            "1. Streamlit Cloud → ⚙️ Settings → Secrets → add:\n"
+            "   `EARTHDATA_USERNAME = \"...\"`\n"
+            "   `EARTHDATA_PASSWORD = \"...\"`\n"
+            "2. Local: create `.streamlit/secrets.toml` next to `app.py`.\n"
+            "3. Or set env vars `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD`.\n\n"
+            "Register free at https://urs.earthdata.nasa.gov"
         )
 
     os.environ["EARTHDATA_USERNAME"] = username
@@ -321,39 +337,36 @@ def login_earthdata():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CARBON MAPPER AUTH  (Tanager-1 / EMIT plume catalog)
+#  CARBON MAPPER AUTH  (user-provided token)
 # ══════════════════════════════════════════════════════════════════════
 
-def get_carbonmapper_token() -> str:
-    """Retrieve Carbon Mapper Bearer token from Streamlit secrets."""
+def get_carbonmapper_token() -> Optional[str]:
+    """Retrieve Carbon Mapper token.
+
+    Priority:
+      1. Token entered by user in the UI (session_state)
+      2. CARBONMAPPER_TOKEN in Streamlit secrets (fallback for local dev)
+    """
+    if st.session_state.get("cm_token"):
+        return st.session_state["cm_token"]
     try:
-        token = st.secrets["CARBONMAPPER_TOKEN"]
+        return st.secrets["CARBONMAPPER_TOKEN"]
     except (KeyError, FileNotFoundError):
-        raise RuntimeError(
-            "Carbon Mapper credentials are not configured. "
-            "Add CARBONMAPPER_TOKEN to Streamlit secrets. "
-            "Register free at https://api.carbonmapper.org"
-        )
-    return token
+        return None
 
 
 def _cm_headers() -> dict:
+    token = get_carbonmapper_token()
+    if not token:
+        raise RuntimeError(
+            "Carbon Mapper token is not set. "
+            "Please enter your token in the search panel above. "
+            "Get one free at https://data.carbonmapper.org"
+        )
     return {
-        "Authorization": f"Bearer {get_carbonmapper_token()}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-
-
-def _cm_bbox_rest(bounds):
-    """Carbon Mapper REST catalog expects repeated bbox keys."""
-    minx, miny, maxx, maxy = bounds
-    return {"bbox": [minx, miny, maxx, maxy]}
-
-
-def _cm_bbox_stac(bounds):
-    """Carbon Mapper STAC expects comma-joined bbox."""
-    minx, miny, maxx, maxy = bounds
-    return f"{minx},{miny},{maxx},{maxy}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -408,7 +421,6 @@ def granule_cloud(granule) -> float:
 
 
 def load_emit_enhancement(granule, aoi, resolution=60):
-    """Load EMIT enhancement clipped to AOI, with nodata masked to NaN."""
     try:
         files = earthaccess.open([granule])
     except Exception as e:
@@ -478,16 +490,11 @@ def load_emit_enhancement(granule, aoi, resolution=60):
 # ══════════════════════════════════════════════════════════════════════
 
 def parse_cm_plume_datetime(plume_id: str) -> Optional[datetime]:
-    """Parse datetime from Carbon Mapper plume ID.
-
-    Format: ``tan20251212t185057c20s4001-E``
-    Prefix ``tan`` / ``emi`` / ``ang`` / ``av3`` / ``gao`` then ``YYYYMMDDThhmmss``.
-    """
     try:
         for prefix in CM_PLATFORM_MAP:
             if plume_id.startswith(prefix):
                 rest = plume_id[len(prefix):]
-                ts = rest[:15]  # YYYYMMDDThhmmss
+                ts = rest[:15]
                 return datetime.strptime(ts, "%Y%m%dT%H%M%S")
     except Exception:
         pass
@@ -507,14 +514,14 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
 
     Correct API contract (from https://api.carbonmapper.org/api/v1/docs):
       - bbox      : repeated keys  -> ?bbox=W&bbox=S&bbox=E&bbox=N
-      - datetime  : "START/END" ISO-8601 interval (not start_time/end_time)
-      - plume_gas : "CH4" (not "gas")
-      - instrument: "tan" / "emi" / "ang" / "av3" / "GAO" (case-sensitive)
+      - datetime  : "START/END" ISO-8601 interval
+      - plume_gas : "CH4"
+      - instrument: "tan" / "emi" / "ang" / "av3" / "GAO"
     """
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
-    dt_end   = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
+    dt_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
 
     all_features = []
@@ -523,7 +530,6 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     max_pages = 20
 
     for _ in range(max_pages):
-        # ✅ Use list of tuples to send repeated bbox keys
         params = [
             ("bbox", minx),
             ("bbox", miny),
@@ -544,6 +550,13 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
             )
             r.raise_for_status()
             data = r.json()
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 401:
+                raise RuntimeError(
+                    "Carbon Mapper token is invalid or expired. "
+                    "Please create a new token at https://data.carbonmapper.org"
+                )
+            raise RuntimeError(f"Carbon Mapper plume search failed: {e}")
         except Exception as e:
             raise RuntimeError(f"Carbon Mapper plume search failed: {e}")
 
@@ -557,10 +570,9 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         offset += limit
 
     return all_features
-                                   
+
 
 def tanager_plumes_only(features):
-    """Keep only Tanager-1 plumes (safety filter)."""
     out = []
     for f in features:
         pid = f.get("properties", {}).get("plume_id", "")
@@ -568,14 +580,13 @@ def tanager_plumes_only(features):
             out.append(f)
     return out
 
+
 def cm_plume_datetime(feature) -> Optional[datetime]:
-    """Extract datetime from a Carbon Mapper plume feature."""
     props = feature.get("properties", {})
     pid = props.get("plume_id", "")
     dt = parse_cm_plume_datetime(pid)
     if dt:
         return dt
-    # fallback: try datetime field
     dt_str = props.get("datetime") or props.get("acquisition_date")
     if dt_str:
         try:
@@ -586,7 +597,6 @@ def cm_plume_datetime(feature) -> Optional[datetime]:
 
 
 def cm_plume_emission(feature) -> float:
-    """Reported emission rate (kg/h) from Carbon Mapper."""
     props = feature.get("properties", {})
     for key in ("emission_auto", "emission_rate_kg_hr", "emission_rate"):
         if key in props and props[key] is not None:
@@ -598,7 +608,6 @@ def cm_plume_emission(feature) -> float:
 
 
 def cm_plume_wind(feature) -> Optional[float]:
-    """Wind speed (m/s) from Carbon Mapper plume properties."""
     props = feature.get("properties", {})
     for key in ("wind_speed", "wind_speed_m_s"):
         if key in props and props[key] is not None:
@@ -610,7 +619,6 @@ def cm_plume_wind(feature) -> Optional[float]:
 
 
 def find_overlap_dates(emit_results, tanager_results):
-    """Find calendar dates that have data from BOTH satellites."""
     emit_dates = set()
     for g in emit_results:
         dt = granule_datetime(g)
@@ -627,21 +635,14 @@ def find_overlap_dates(emit_results, tanager_results):
 
 
 def tanager_scene_id(plume_id: str) -> str:
-    """Scene ID from plume ID: ``tan20251212t185057c20s4001-E`` → ``tan20251212t185057c20s4001``."""
     return plume_id.rsplit("-", 1)[0]
 
 
 def load_tanager_enhancement(plume_feature, aoi):
-    """Load Tanager-1 enhancement raster from Carbon Mapper STAC.
-
-    Returns ``(data, transform, crs)`` or ``(None, None, None)`` if the
-    L2B scene is not yet published (publication lag: weeks to months).
-    """
     props = plume_feature.get("properties", {})
     plume_id = props.get("plume_id", "")
     scene_id = tanager_scene_id(plume_id)
 
-    # Try to fetch STAC item for the L2B scene
     try:
         url = f"{CM_STAC_BASE}/collections/{SATELLITES['Tanager-1']['collection']}/items/{scene_id}"
         r = requests.get(url, headers=_cm_headers(), timeout=30)
@@ -650,7 +651,6 @@ def load_tanager_enhancement(plume_feature, aoi):
     except Exception:
         return None, None, None
 
-    # Prefer cmf.tif (concentration methane file, orthorectified)
     assets = item.get("assets", {})
     cmf_url = None
     for key in ("cmf.tif", "cmf", "concentration"):
@@ -663,11 +663,6 @@ def load_tanager_enhancement(plume_feature, aoi):
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     try:
-        # Carbon Mapper STAC asset URLs are token-gated; pass header via rasterio
-        import rasterio
-        from rasterio.session import DummySession
-
-        # Download to memory using requests (handles auth), then open
         resp = requests.get(cmf_url, headers=_cm_headers(), timeout=60, stream=True)
         resp.raise_for_status()
         raw = io.BytesIO(resp.content)
@@ -718,7 +713,6 @@ def load_tanager_enhancement(plume_feature, aoi):
 
 
 def cm_plume_geojson(features):
-    """Build a FeatureCollection of plume geometries for map overlay."""
     feats = []
     for f in features:
         geom = f.get("geometry")
@@ -736,7 +730,6 @@ def cm_plume_geojson(features):
 # ══════════════════════════════════════════════════════════════════════
 
 def search_all_satellites(aoi, start_date, end_date, satellites=None):
-    """Search both EMIT and Tanager-1; return dict of results."""
     if satellites is None:
         satellites = ["EMIT", "Tanager-1"]
 
@@ -816,7 +809,6 @@ def detect_plume(enhancement, threshold_ppm_m, min_pixels):
 
 
 def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s, resolution=60):
-    """IME-based flux estimation. ``resolution`` is the native pixel size (m)."""
     empty = {
         "Q_kg_h": 0.0, "Q_ton_h": 0.0,
         "IME_ppm_m2": 0.0, "IME_kg": 0.0,
@@ -886,7 +878,6 @@ def enhancement_png(
     vmin=None,
     vmax=None,
 ):
-    """Render enhancement with optional plume overlay + outline."""
     from PIL import Image
     import matplotlib.pyplot as plt
 
@@ -931,7 +922,6 @@ def enhancement_png(
 
 
 def placeholder_png(text="No raster available"):
-    """Render a simple placeholder PNG."""
     from PIL import Image, ImageDraw, ImageFont
     img = Image.new("RGB", (600, 300), "#f8fbfb")
     d = ImageDraw.Draw(img)
@@ -1149,6 +1139,8 @@ div[data-testid="stDataFrame"] * { color: #111111 !important; }
 .satellite-badge.tanager { background: #fde8ea; color: #7a1f27 !important; border: 1px solid #e63946; }
 .overlap-banner { background: linear-gradient(90deg, #e8f7ea 0%, #f1faee 100%); border: 1px solid #9ed2a4; border-radius: 11px; padding: 0.55rem 0.75rem; font-size: 0.8rem; font-weight: 700; color: #155724 !important; margin-bottom: 0.45rem; }
 .compare-header { display: flex; align-items: center; gap: 0.45rem; font-size: 0.85rem; font-weight: 800; margin-bottom: 0.3rem; }
+.token-status-ok { background: #e8f7ea; border: 1px solid #9ed2a4; color: #155724 !important; border-radius: 9px; padding: 0.4rem 0.6rem; font-size: 0.74rem; font-weight: 700; }
+.token-status-missing { background: #fff3cd; border: 1px solid #ffc107; color: #856404 !important; border-radius: 9px; padding: 0.4rem 0.6rem; font-size: 0.74rem; font-weight: 700; }
 footer { visibility: hidden; }
 .stMarkdown { margin-bottom: 0.1rem; }
 .element-container { margin-bottom: 0.15rem; }
@@ -1174,6 +1166,9 @@ if not EARTHACCESS_AVAILABLE:
 
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(DEFAULT_AOI)
+
+if "cm_token" not in st.session_state:
+    st.session_state.cm_token = ""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1262,7 +1257,6 @@ with map_col:
             unsafe_allow_html=True,
         )
 
-    # Overlay Tanager plume geometries on map if available
     _map_layers = []
     _tan_feats = st.session_state.get("tanager_features", [])
     if _tan_feats:
@@ -1323,7 +1317,6 @@ with control_col:
     with d2:
         end_date = st.date_input("End date", default_end, key="end_date")
 
-    # ── Satellite selector ──
     satellite_choice = st.multiselect(
         "Satellites to search",
         options=list(SATELLITES.keys()),
@@ -1339,50 +1332,140 @@ with control_col:
         unsafe_allow_html=True,
     )
 
+    # ════════════════════════════════════════════════════════════════
+    #  🔑 CARBON MAPPER TOKEN INPUT  (user-friendly)
+    # ════════════════════════════════════════════════════════════════
+    if "Tanager-1" in satellite_choice:
+        st.markdown("---")
+        st.markdown(
+            '<div class="card-title" style="font-size:0.9rem;">🔑 Carbon Mapper Access</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Show current token status
+        _existing_token = get_carbonmapper_token()
+        if _existing_token:
+            st.markdown(
+                f'<div class="token-status-ok">'
+                f'✅ Token loaded — Tanager-1 data available'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="token-status-missing">'
+                f'⚠️ No token set — Tanager-1 search will be skipped'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        with st.expander("🔓 Enter or update your Carbon Mapper token", expanded=not _existing_token):
+            st.markdown(
+                '<div class="auth-help">'
+                'Tanager-1 data is hosted by <b>Carbon Mapper</b> (separate from NASA Earthdata). '
+                'You need a free personal API token to access it.<br><br>'
+                '<b>How to get one:</b><br>'
+                '1. Go to <a href="https://data.carbonmapper.org" target="_blank">data.carbonmapper.org</a><br>'
+                '2. Create a free account (takes 1 minute)<br>'
+                '3. In your profile, click <b>Create API Token</b><br>'
+                '4. Copy the token and paste it below<br><br>'
+                '<b>Note:</b> Tokens expire after ~1 year. '
+                'When it expires, just create a new one and paste it here.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            _token_input = st.text_input(
+                "Paste your Carbon Mapper token here:",
+                type="password",
+                key="cm_token_input",
+                placeholder="eyJhbGciOiJIUzI1NiIs...",
+                label_visibility="collapsed",
+            )
+
+            tc1, tc2 = st.columns([1, 1], gap="small")
+            with tc1:
+                if st.button("💾 Save token", use_container_width=True, key="save_cm_token"):
+                    if _token_input.strip():
+                        st.session_state.cm_token = _token_input.strip()
+                        st.success("✅ Token saved. You can now search Tanager-1.")
+                        st.rerun()
+                    else:
+                        st.warning("Please paste a token first.")
+            with tc2:
+                if st.button("🗑️ Clear token", use_container_width=True, key="clear_cm_token"):
+                    st.session_state.cm_token = ""
+                    st.info("Token cleared.")
+                    st.rerun()
+
+        st.markdown("---")
+
     if st.button("🔎  Search satellites", type="primary", use_container_width=True):
         if not satellite_choice:
             st.warning("Select at least one satellite.")
         else:
-            try:
-                with st.spinner("Authenticating…"):
-                    if "EMIT" in satellite_choice:
-                        login_earthdata()
+            results = {"EMIT": [], "Tanager-1": [], "errors": []}
 
-                with st.spinner("Searching EMIT and Tanager-1…"):
-                    results = search_all_satellites(
-                        st.session_state.aoi, start_date, end_date,
-                        satellites=satellite_choice,
+            # ── EMIT (needs Earthdata) ──
+            if "EMIT" in satellite_choice:
+                try:
+                    with st.spinner("Authenticating with NASA Earthdata…"):
+                        login_earthdata()
+                    with st.spinner("Searching EMIT…"):
+                        results["EMIT"] = search_emit_granules(
+                            st.session_state.aoi, start_date, end_date
+                        )
+                except Exception as e:
+                    results["errors"].append(f"EMIT unavailable: {e}")
+                    st.warning(
+                        f"⚠️ EMIT search skipped — {e}\n\n"
+                        f"Tanager-1 results are still shown below."
                     )
 
-                st.session_state["search_results"] = results
-                st.session_state["tanager_features"] = results.get("Tanager-1", [])
-                st.session_state.pop("selected_granule", None)
-                st.session_state.pop("selected_tanager", None)
-                st.session_state.pop("emit_result", None)
-
-                for err in results.get("errors", []):
-                    st.warning(err)
-
-                n_emit = len(results.get("EMIT", []))
-                n_tan = len(results.get("Tanager-1", []))
-                if n_emit or n_tan:
-                    st.success(
-                        f"Found {n_emit} EMIT granule(s) and {n_tan} Tanager-1 plume(s)"
+            # ── Tanager-1 (independent) ──
+            if "Tanager-1" in satellite_choice:
+                if not get_carbonmapper_token():
+                    results["errors"].append(
+                        "Tanager-1: No Carbon Mapper token set. "
+                        "Please enter your token above."
+                    )
+                    st.warning(
+                        "⚠️ Tanager-1 search skipped — no Carbon Mapper token set. "
+                        "Please enter your token in the Carbon Mapper Access section above."
                     )
                 else:
-                    st.warning(
-                        "No data found for this AOI and time range. "
-                        "Try a wider date range."
-                    )
-            except Exception as e:
-                st.session_state["search_results"] = {"EMIT": [], "Tanager-1": [], "errors": [str(e)]}
-                st.error(f"Search failed: {e}")
+                    try:
+                        with st.spinner("Searching Tanager-1 (Carbon Mapper)…"):
+                            cm_feats = search_carbonmapper_plumes(
+                                st.session_state.aoi, start_date, end_date
+                            )
+                            results["Tanager-1"] = tanager_plumes_only(cm_feats)
+                    except Exception as e:
+                        results["errors"].append(f"Tanager-1 unavailable: {e}")
+                        st.warning(f"⚠️ Tanager-1 search failed — {e}")
+
+            st.session_state["search_results"] = results
+            st.session_state["tanager_features"] = results.get("Tanager-1", [])
+            st.session_state.pop("selected_granule", None)
+            st.session_state.pop("selected_tanager", None)
+            st.session_state.pop("emit_result", None)
+
+            n_emit = len(results.get("EMIT", []))
+            n_tan = len(results.get("Tanager-1", []))
+            if n_emit or n_tan:
+                st.success(
+                    f"Found {n_emit} EMIT granule(s) and {n_tan} Tanager-1 plume(s)"
+                )
+            elif not results["errors"]:
+                st.warning(
+                    "No data found for this AOI and time range. "
+                    "Try a wider date range."
+                )
 
     search_results = st.session_state.get("search_results", {"EMIT": [], "Tanager-1": []})
     emit_results = search_results.get("EMIT", [])
     tanager_results = search_results.get("Tanager-1", [])
 
-    # ── Unified results table ──
     if emit_results or tanager_results:
         rows = []
         for g in emit_results:
@@ -1418,7 +1501,6 @@ with control_col:
             },
         )
 
-        # ── Overlap detection ──
         overlap_dates = find_overlap_dates(emit_results, tanager_results)
         if overlap_dates:
             date_strs = ", ".join(d.strftime("%Y-%m-%d") for d in overlap_dates[:5])
@@ -1434,8 +1516,20 @@ with control_col:
                 "No calendar-day overlap found between EMIT and Tanager-1 "
                 "in this window. Try a wider date range."
             )
+            if not tanager_results:
+                st.info(
+                    "ℹ️ **Tanager-1 is a targeted satellite, not global.**\n\n"
+                    "It images ~18-20 km swaths over **priority methane regions** "
+                    "(oil & gas basins, coal mines, landfills) with a minimum detection "
+                    "limit of ~50-200 kg/h.\n\n"
+                    "Zero plumes may mean:\n"
+                    "1. No tasking over this AOI (most likely for non-priority regions)\n"
+                    "2. Plume below detection threshold\n"
+                    "3. Data not yet published (30-day latency)\n\n"
+                    "**Try a known methane hotspot** like the Permian Basin (Texas) "
+                    "to verify the Tanager-1 pipeline works."
+                )
 
-        # ── Granule / plume selector ──
         def format_item(idx):
             r = table.iloc[idx]
             dt = r["date"]
@@ -1451,7 +1545,6 @@ with control_col:
         chosen_row = table.iloc[selected_idx]
 
         if chosen_row["satellite"] == "EMIT":
-            # Map back to EMIT granule
             emit_rows = table[table["satellite"] == "EMIT"].reset_index(drop=True)
             emit_pos = emit_rows[emit_rows["id"] == chosen_row["id"]].index
             if len(emit_pos):
@@ -1548,7 +1641,6 @@ with action_col:
                 progress.progress(10, text="Logging in…")
 
                 if selected_granule is not None:
-                    # ── EMIT path ──
                     login_earthdata()
                     res = SATELLITES["EMIT"]["resolution"]
 
@@ -1604,7 +1696,6 @@ with action_col:
                     st.session_state.pop("tanager_result", None)
 
                 else:
-                    # ── Tanager-1 path ──
                     res = SATELLITES["Tanager-1"]["resolution"]
                     progress.progress(30, text="Loading Tanager-1 plume data…")
 
@@ -1612,7 +1703,6 @@ with action_col:
                     reported_flux = cm_plume_emission(selected_tanager)
                     cm_wind = cm_plume_wind(selected_tanager)
 
-                    # Try to load L2B raster (may be unpublished)
                     data, transform, crs = load_tanager_enhancement(
                         selected_tanager, st.session_state.aoi
                     )
@@ -1643,7 +1733,6 @@ with action_col:
                             data, plume_mask, wind_speed_to_use, resolution=res
                         )
                     else:
-                        # No raster — use Carbon Mapper reported values
                         plume_mask = np.zeros((1, 1), dtype=bool)
                         flux = {
                             "Q_kg_h": reported_flux,
@@ -1706,7 +1795,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
 
-    # ── Comparison mode ──
     if has_emit and has_tan:
         st.markdown(
             '<div class="card-title">🔬 Side-by-side comparison</div>'
@@ -1718,7 +1806,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
         emit_res = st.session_state.emit_result
         tan_res = st.session_state.tanager_result
 
-        # Comparison metrics table
         def _metric_row(name, emit_val, tan_val, unit=""):
             return {"Metric": name, "EMIT": emit_val, "Tanager-1": tan_val, "Unit": unit}
 
@@ -1738,7 +1825,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                         f"{tan_res['wind_speed']:.2f}", "m/s"),
         ]
 
-        # Add reported flux if available
         if tan_res.get("reported_flux_kg_h"):
             comp_rows.append(_metric_row(
                 "Reported flux (CM)", "—",
@@ -1752,7 +1838,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
             height=min(280, 38 * len(comp_rows) + 40),
         )
 
-        # Side-by-side enhancement maps
         vmin_e, vmax_e = _compute_vrange(emit_res["enhancement"])
         vmin_t, vmax_t = _compute_vrange(tan_res["enhancement"])
 
@@ -1825,7 +1910,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
         )
 
     else:
-        # ── Single-satellite results (existing behaviour preserved) ──
         result = st.session_state.get("emit_result") or st.session_state.get("tanager_result")
         flux = result["flux"]
         enhancement = result["enhancement"]
@@ -1916,7 +2000,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                 )
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # IME note
         if flux["n_pixels"] > 0:
             st.markdown(
                 f'<div class="result-note">'
@@ -2009,7 +2092,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  06 · MULTI-DATE COMPARISON  (upgraded for both satellites)
+#  06 · MULTI-DATE COMPARISON
 # ══════════════════════════════════════════════════════════════════════
 
 search_results = st.session_state.get("search_results", {})
@@ -2061,7 +2144,6 @@ if emit_results or tanager_results:
         batch_results = []
         _centroid_batch = shape(st.session_state.aoi).centroid
 
-        # Build combined list
         jobs = []
         if "EMIT" in batch_sat:
             for g in emit_results:
@@ -2190,7 +2272,6 @@ if emit_results or tanager_results:
         if chart_rows:
             chart_df = pd.DataFrame(chart_rows).sort_values("date")
 
-            # Dual-line chart (EMIT vs Tanager-1)
             pivot = chart_df.pivot_table(
                 index="date", columns="satellite", values="flux_kg_h", aggfunc="first"
             )
@@ -2217,7 +2298,6 @@ if emit_results or tanager_results:
                 use_container_width=False,
             )
 
-        # Visual comparison slider
         st.markdown("##### Visual comparison")
         dates_labels = [
             f"[{r['satellite']}] " +
@@ -2234,7 +2314,6 @@ if emit_results or tanager_results:
         )
         chosen = batch[selected_idx]
 
-        # Shared color range across all batch results that have raster
         _all_vals = []
         for r in batch:
             e = r.get("enhancement")
@@ -2317,7 +2396,7 @@ if emit_results or tanager_results:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  07 · PLUME EVOLUTION WINDOW  (upgraded for both satellites)
+#  07 · PLUME EVOLUTION WINDOW
 # ══════════════════════════════════════════════════════════════════════
 
 if "emit_result" in st.session_state or "tanager_result" in st.session_state:
@@ -2386,7 +2465,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
 
             progress = st.progress(0, text="Searching satellites…")
             try:
-                # Search both
                 if evo_sat_filter == "Both":
                     _evo_sats = ["EMIT", "Tanager-1"]
                 elif evo_sat_filter == "EMIT only":
@@ -2493,7 +2571,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                                     }
                                     has_raster = False
 
-                            # Centroid
                             centroid_geo = None
                             if pm.any() and tform is not None:
                                 ys, xs = np.nonzero(pm)
@@ -2556,7 +2633,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                 unsafe_allow_html=True,
             )
 
-            # Coverage table
             cov_rows = []
             for r in evo:
                 if r["has_raster"]:
@@ -2580,7 +2656,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                 },
             )
 
-            # Evolution dataframe
             rows = []
             for r in evo:
                 rows.append({
@@ -2637,7 +2712,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     use_container_width=False,
                 )
 
-            # Centroid movement
             geo_pts = [
                 (r["date"], r["centroid_geo"])
                 for r in evo
@@ -2650,7 +2724,7 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     crows.append({"date": d, "x": gx, "y": gy})
                 cdf = pd.DataFrame(crows).sort_values("date")
                 x0, y0 = cdf.iloc[0]["x"], cdf.iloc[0]["y"]
-                cdf["dx_px"] = (cdf["x"] - x0) / 30  # approximate
+                cdf["dx_px"] = (cdf["x"] - x0) / 30
                 cdf["dy_px"] = (cdf["y"] - y0) / 30
                 st.dataframe(
                     cdf[["date", "dx_px", "dy_px"]],
@@ -2662,7 +2736,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     },
                 )
 
-            # Shared color range
             all_valid = []
             for r in evo:
                 e = r.get("enhancement")
@@ -2676,7 +2749,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
             if shared_vmax <= shared_vmin:
                 shared_vmax = shared_vmin + 1.0
 
-            # Visual evolution slider
             st.markdown("##### Visual evolution")
             dates_labels = [
                 f"[{r['satellite']}] " +
@@ -2759,7 +2831,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
             em3.metric("Plume area (km²)", f"{chosen['flux']['plume_area_m2']/1e6:.3f}")
             em4.metric("Max enh. (ppm·m)", f"{chosen['flux']['max_enhancement']:.0f}")
 
-            # Gallery
             st.markdown("##### Plume mask gallery (all observations)")
             n_cols = 4
             n_obs = len(evo)
