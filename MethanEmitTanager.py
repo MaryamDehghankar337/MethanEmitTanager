@@ -493,18 +493,24 @@ def cm_plume_platform(plume_id: str) -> str:
 
 def search_carbonmapper_plumes(aoi, start_date, end_date,
                                gas="CH4", instrument="tan"):
-    """Search Carbon Mapper via STAC (works with stac.catalog:read scope)."""
+    """Search Carbon Mapper via STAC with required collections parameter."""
     minx, miny, maxx, maxy = aoi_bounds(aoi)
-    bbox = [minx, miny, maxx, maxy]
 
     dt_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
     dt_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
     datetime_range = f"{dt_start}/{dt_end}"
 
+    # ✅ اضافه کردن collections به بدنه درخواست (الزامی برای STAC search)
     body = {
-        "bbox": bbox,
+        "bbox": [minx, miny, maxx, maxy],
         "datetime": datetime_range,
         "limit": 200,
+        "collections": [
+            "l3a-vis-ch4",
+            "l3a-ime-ch4",
+            "l3b-plumemetrics-ch4",
+            "l2b-ch4",
+        ],
     }
 
     try:
@@ -522,7 +528,11 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
                 "Carbon Mapper token is invalid or expired. "
                 "Please create a new token at https://data.carbonmapper.org"
             )
-        raise RuntimeError(f"Carbon Mapper STAC search failed: {e}")
+        # ✅ چاپ پاسخ کامل سرور برای دیباگ
+        raise RuntimeError(
+            f"Carbon Mapper STAC search failed: {e}\n"
+            f"Server response: {r.text[:500]}"
+        )
     except Exception as e:
         raise RuntimeError(f"Carbon Mapper STAC search failed: {e}")
 
@@ -530,7 +540,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
     if not items:
         return []
 
-    keep_prefixes = ("l3a-vis-ch4", "l3b-plumemetrics-ch4")
+    keep_prefixes = ("l3a-vis-ch4", "l3a-ime-ch4", "l3b-plumemetrics-ch4")
 
     features = []
     for item in items:
@@ -554,7 +564,7 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
         emission = 0.0
         for key in ("emission_rate", "emission_auto", "emission_rate_kg_hr",
                     "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-                    "emission_estimate", "emission"):
+                    "emission_estimate", "emission", "ime_flux"):
             if key in props and props[key] is not None:
                 try:
                     emission = float(props[key])
@@ -610,7 +620,6 @@ def search_carbonmapper_plumes(aoi, start_date, end_date,
 
     final = []
     for f in by_scene.values():
-        # If geometry is missing, skip
         if f.get("geometry") is None:
             continue
         if instrument == "tan" and not f["id"].startswith("tan"):
@@ -636,7 +645,7 @@ def cm_plume_emission(feature) -> float:
     props = feature.get("properties", {})
     for key in ("emission_auto", "emission_rate_kg_hr", "emission_rate",
                 "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-                "emission_estimate", "emission"):
+                "emission_estimate", "emission", "ime_flux"):
         if key in props and props[key] is not None:
             try:
                 return float(props[key])
@@ -645,7 +654,7 @@ def cm_plume_emission(feature) -> float:
     stac_props = props.get("_stac_props", {})
     for key in ("emission_rate", "emission_auto", "emission_rate_kg_hr",
                 "flux_kg_hr", "cm_emission_rate", "ch4_emission_rate",
-                "emission_estimate", "emission"):
+                "emission_estimate", "emission", "ime_flux"):
         if key in stac_props and stac_props[key] is not None:
             try:
                 return float(stac_props[key])
@@ -778,7 +787,6 @@ def load_tanager_enhancement(plume_feature, aoi):
                 invert=True,
             )
             if plume_mask.any():
-                # Build smooth gradient: peak at plume center, taper to edges
                 dist = distance_transform_edt(plume_mask).astype(np.float32)
                 max_d = float(dist.max())
                 if max_d <= 0:
@@ -1865,7 +1873,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
 
     if has_raster and enhancement is not None and enhancement.size > 0:
         vmin_enh, vmax_enh = _compute_vrange(enhancement)
-        # For fallback Tanager rasters, force a sensible range
         finite_vals = enhancement[np.isfinite(enhancement)]
         if finite_vals.size > 0 and np.unique(finite_vals).size < 30:
             vmin_enh = 0.0
@@ -2441,7 +2448,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                 else:
                     _evo_sats = ["Tanager-1"]
 
-                # Log in to Earthdata BEFORE searching (EMIT needs it)
                 if "EMIT" in _evo_sats:
                     try:
                         login_earthdata()
@@ -2453,7 +2459,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     satellites=_evo_sats,
                 )
 
-                # Report what was found
                 n_emit_found = len(results_evo.get("EMIT", []))
                 n_tan_found = len(results_evo.get("Tanager-1", []))
                 if results_evo.get("errors"):
@@ -2722,7 +2727,6 @@ if "emit_result" in st.session_state or "tanager_result" in st.session_state:
                     },
                 )
 
-            # Shared color range
             all_valid = []
             for r in evo:
                 e = r.get("enhancement")
